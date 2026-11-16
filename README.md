@@ -1,8 +1,8 @@
 # Kubernetes and Azure Red Hat OpenShift, lab kit
 
-This is the lab kit of the course "Kubernetes and Azure Red Hat OpenShift, hands-on". The course website has the chapters, the lab tasks and the costs. This repository has everything you run: the `course` command, the scripts that build your lab environment in your own Azure subscription, the lab scripts that check your work, the sample app and the reference solutions.
+This is the lab kit of the course "Kubernetes and Azure Red Hat OpenShift, hands-on". The [course website](https://ashy-tree-001ac5303.6.azurestaticapps.net/) has the chapters, the lab tasks and the costs. This repository has everything you run: the `course` command, the scripts that build your lab environment in your own Azure subscription, the lab scripts that check your work, the sample app and the reference solutions.
 
-Read the Introduction and Setup pages of the course website before you run anything here. They explain what each command creates and what it costs.
+Read the [Introduction](https://ashy-tree-001ac5303.6.azurestaticapps.net/introduction.html) and [Setup](https://ashy-tree-001ac5303.6.azurestaticapps.net/setup.html) pages of the course website before you run anything here. They explain what each command creates and what it costs.
 
 ## How it works
 
