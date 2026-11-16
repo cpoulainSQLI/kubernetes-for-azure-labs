@@ -1,0 +1,654 @@
+#!/usr/bin/env bash
+# The course command: one entry point for the lab VM and for every lab of the kit.
+# On your own computer it manages the lab environment in Azure. On the lab VM it runs the labs.
+# course.ps1 does the same as the commands for your own computer, in PowerShell on Windows.
+# Run ./course help on either side for the list of commands.
+set -euo pipefail
+
+COURSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/lib.sh
+source "${COURSE_DIR}/lib/lib.sh"
+
+# The commands of each side. tools/check-kit.py and the checker of the website read these two lines.
+LAPTOP_COMMANDS="up connect status check stop destroy update help"
+VM_COMMANDS="start check break solution clean update help"
+
+laptop_usage() {
+  cat <<'EOF'
+Usage on your own computer, from the kit folder (.\course.ps1 in PowerShell):
+  ./course up [--yes] [--apply]   create the lab environment, or start the lab VM if it exists.
+                                  --apply also applies a change made to .env. Safe to run twice.
+  ./course connect                open an SSH session on the lab VM (type exit to leave)
+  ./course status                 show the power state, the IP address and the shutdown time
+  ./course check                  readiness report of the lab environment. Changes nothing.
+  ./course stop                   deallocate the lab VM. Your work on it is kept.
+  ./course destroy [--yes]        delete the lab environment and the Terraform state
+  ./course update                 update the kit here (git pull), and on the lab VM if it runs
+On the lab VM, course start, check, break, solution and clean run the labs: connect, then run course help.
+EOF
+}
+
+vm_usage() {
+  cat <<'EOF'
+Usage on the lab VM:
+  course start NN [--yes]                set up lab NN, for example: course start 01
+  course check NN [--guided | --stage N | --deep]
+                                         check your work on lab NN. Read-only without --deep.
+  course break NN [--diagnose | --restore]
+                                         put one fault into your finished lab, then find it
+  course solution NN [--yes]             copy the reference solution into ~/work, after asking
+  course clean NN [--yes]                remove what lab NN created
+  course update                          update the kit (git pull). Your work in ~/work is kept.
+The commands that manage the lab VM itself (up, stop, destroy) run on your own computer.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Both sides
+# ---------------------------------------------------------------------------
+
+# Brings the clone of the kit up to date with git pull. Your work in ~/work is not part of the kit.
+kit_update() {
+  require_cmd git "Install Git: https://git-scm.com/downloads"
+  if ! git -C "$COURSE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    die "${COURSE_DIR} is not a Git clone, so it cannot be updated. Clone the kit with Git."
+  fi
+  step "Updating the kit in ${COURSE_DIR}"
+  if ! git -C "$COURSE_DIR" pull --ff-only; then
+    die "git pull failed. If you changed files of the kit, list them with: git -C \"${COURSE_DIR}\" status"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# On your own computer
+# ---------------------------------------------------------------------------
+
+vm_power_state() {
+  az vm get-instance-view --resource-group "$(rg_name)" --name "$(vm_name)" \
+    --query "instanceView.statuses[?starts_with(code, 'PowerState/')].code | [0]" --output tsv 2>/dev/null || true
+}
+
+laptop_preflight() {
+  load_env
+  require_cmd az "Install the Azure CLI: https://learn.microsoft.com/cli/azure/install-azure-cli"
+  require_az_login
+  require_expected_subscription
+}
+
+laptop_up() {
+  local apply=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) ASSUME_YES=1 ;;
+      --apply) apply=1 ;;
+      -h | --help)
+        laptop_usage
+        exit 0
+        ;;
+      *) die "Unknown option: ${arg}. Run: ./course help" ;;
+    esac
+  done
+
+  # step: preflight
+  laptop_preflight
+  require_cmd ssh "Install an OpenSSH client."
+  require_cmd scp "Install an OpenSSH client."
+  if [[ -z "$LEARNER_IP" ]]; then
+    die "Set LEARNER_IP in .env to your public IPv4 address."
+  fi
+  if [[ ! "$LEARNER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    die "LEARNER_IP must be a plain IPv4 address, without /32."
+  fi
+  local key_file ssh_public_key
+  key_file="$(ssh_key_file)"
+  if [[ ! -f "$key_file" || ! -f "${key_file}.pub" ]]; then
+    die "No SSH key pair at ${SSH_KEY_PATH}. Create it with: ssh-keygen -t ed25519 -f ${SSH_KEY_PATH} -C aro-k8s-lab"
+  fi
+  ssh_public_key="$(tr -d '\r\n' <"${key_file}.pub")"
+  if [[ "$ssh_public_key" != ssh-ed25519* && "$ssh_public_key" != ssh-rsa* ]]; then
+    die "${SSH_KEY_PATH}.pub is not an Ed25519 or RSA public key."
+  fi
+
+  # step: kit-url
+  local kit_url
+  kit_url="$(kit_repo_url)"
+  if [[ -z "$kit_url" ]]; then
+    die "Could not work out where the lab VM clones the kit from. Clone the kit with Git, or set KIT_REPO in .env to its HTTPS URL."
+  fi
+  info "The lab VM clones the kit from ${kit_url}"
+
+  # step: existing
+  local rg vm vm_existed="false" nsg_source
+  rg="$(rg_name)"
+  vm="$(vm_name)"
+  if az vm show --resource-group "$rg" --name "$vm" --output none 2>/dev/null; then
+    vm_existed="true"
+  fi
+  nsg_source="$(az network nsg rule show --resource-group "$rg" --nsg-name "${vm}-nsg" --name allow-ssh-from-learner \
+    --query sourceAddressPrefix --output tsv 2>/dev/null || true)"
+  if [[ "$vm_existed" == "true" && "$nsg_source" == "${LEARNER_IP}/32" && "$apply" == "0" ]]; then
+    info "The lab environment exists. To apply a change made to .env, run: ./course up --apply"
+  else
+    if [[ "$vm_existed" == "true" && "$nsg_source" != "${LEARNER_IP}/32" ]]; then
+      info "The lab VM accepts SSH from ${nsg_source:-no address}, and LEARNER_IP in .env is ${LEARNER_IP}. Terraform updates the rule."
+    fi
+    up_with_terraform "$ssh_public_key" "$kit_url"
+  fi
+
+  # step: start-vm
+  local power_state vm_ip
+  power_state="$(vm_power_state)"
+  if [[ "$power_state" != "PowerState/running" ]]; then
+    info "The lab VM is ${power_state#PowerState/}. Starting it (about a minute)."
+    az vm start --resource-group "$rg" --name "$vm" --output none
+  fi
+  vm_ip="$(vm_public_ip)"
+  if [[ "$vm_existed" == "false" ]]; then
+    # A new VM can reuse an old IP address with a new host key: forget the old key.
+    ssh-keygen -R "$vm_ip" -f "$(known_hosts_file)" >/dev/null 2>&1 || true
+  fi
+
+  # step: wait-ssh
+  step "Waiting for SSH on ${vm_ip}"
+  local ready="false"
+  for _ in $(seq 1 30); do
+    if tcp_port_open "$vm_ip" 22; then
+      ready="true"
+      break
+    fi
+    sleep 10
+  done
+  if [[ "$ready" != "true" ]]; then
+    die "SSH did not answer after 5 minutes. Check that LEARNER_IP in .env is still your public IP, then run: ./course up"
+  fi
+
+  # step: wait-cloud-init
+  step "Waiting for cloud-init to install the tools (5 to 10 minutes on the first run)"
+  if ! lab_ssh "cloud-init status --wait > /dev/null 2>&1; test -f /etc/aro-k8s/tools-ready"; then
+    die "The tool installation did not finish. Connect with ./course connect, then read the log: sudo tail -n 50 /var/log/aro-k8s-install.log"
+  fi
+  lab_ssh "cat /etc/aro-k8s/tools-ready"
+
+  # step: kit-on-vm
+  step "The kit on the lab VM"
+  install_kit_on_vm "$kit_url"
+
+  # step: done
+  step "Done"
+  info "This run took $(duration_text "$SECONDS")."
+  info "Lab VM: ${vm} in ${rg}, at ${vm_ip}, reachable from ${LEARNER_IP} only."
+  info "It shuts down every day at ${AUTO_SHUTDOWN_TIME} (${AUTO_SHUTDOWN_TIMEZONE}). Stop it yourself when you finish: ./course stop"
+  info "Next: the readiness report, then a session on the lab VM."
+  info "  ./course check"
+  info "  ./course connect"
+}
+
+# Creates or updates the lab environment with Terraform: the state storage first, then the configuration in setup/infra.
+up_with_terraform() {
+  local ssh_public_key="$1" kit_url="$2"
+  require_terraform
+
+  # step: subscription
+  step "Subscription"
+  local sub_id sub_name sub_state spending_limit
+  sub_id="$(az account show --query id --output tsv)"
+  sub_name="$(az account show --query name --output tsv)"
+  sub_state="$(az account show --query state --output tsv)"
+  spending_limit="$(az rest --method get \
+    --url "https://management.azure.com/subscriptions/${sub_id}?api-version=2022-12-01" \
+    --query subscriptionPolicies.spendingLimit --output tsv 2>/dev/null || echo "unknown")"
+  info "Subscription: ${sub_name} (${sub_state}), spending limit: ${spending_limit}"
+  if [[ "$sub_state" != "Enabled" ]]; then
+    die "The subscription is ${sub_state}. Wait for the next billing period or pick another subscription."
+  fi
+  if [[ "$spending_limit" == "Off" ]]; then
+    info "Warning: the spending limit is off, so nothing stops charges at the credit amount. The budget alerts still work."
+  fi
+
+  # step: region
+  step "Checking the region, the VM size and the image"
+  local size_found size_restrictions
+  size_found="$(az vm list-skus --location "$REGION" --size "$VM_SIZE" --resource-type virtualMachines \
+    --query "[?name=='${VM_SIZE}'] | length(@)" --output tsv)"
+  if [[ "$size_found" == "0" ]]; then
+    die "${VM_SIZE} is not offered in ${REGION}. Pick another REGION or VM_SIZE in .env."
+  fi
+  size_restrictions="$(az vm list-skus --location "$REGION" --size "$VM_SIZE" --resource-type virtualMachines \
+    --query "[?name=='${VM_SIZE}'].restrictions[].reasonCode" --output tsv)"
+  if [[ -n "$size_restrictions" ]]; then
+    die "${VM_SIZE} is restricted for this subscription in ${REGION} (${size_restrictions}). Pick another REGION or VM_SIZE in .env."
+  fi
+  if ! az vm image show --urn "$VM_IMAGE" --location "$REGION" --output none 2>/dev/null; then
+    die "The image ${VM_IMAGE} is not available in ${REGION}. List the options with: az vm image list --publisher Canonical --offer ubuntu-26_04-lts --location ${REGION} --all --output table"
+  fi
+  info "OK: ${VM_SIZE} and ${VM_IMAGE} are available in ${REGION}."
+
+  # step: cost
+  step "Estimated cost (Azure Retail Prices API, ${CURRENCY}, pay-as-you-go)"
+  local vm_hour disk_month ip_hour
+  vm_hour="$(price_vm_hour)"
+  disk_month="$(price_disk_month)"
+  ip_hour="$(price_public_ip_hour)"
+  info "Lab VM ${VM_SIZE}: ${vm_hour} per hour, only while it runs."
+  info "OS disk ${OS_DISK_GB} GiB Standard SSD: ${disk_month} per month, even while the VM is stopped."
+  info "Public IPv4 address: ${ip_hour} per hour, even while the VM is stopped."
+  info "Terraform state storage: $(price_blob_gb_month) per GB per month. The state takes a few kilobytes."
+  if [[ "$vm_hour" != "n/a" && "$disk_month" != "n/a" && "$ip_hour" != "n/a" ]]; then
+    awk -v vm="$vm_hour" -v disk="$disk_month" -v ip="$ip_hour" -v cur="$CURRENCY" 'BEGIN {
+      printf "About %.2f %s per month if the VM runs 2 hours a day (60 hours).\n", vm * 60 + disk + ip * 730, cur
+      printf "About %.2f %s per day while the VM is stopped (disk and IP address).\n", disk / 30.4 + ip * 24, cur
+    }'
+  fi
+  info "Budget: ${BUDGET_AMOUNT} ${CURRENCY} per month for the whole subscription, with alerts."
+
+  # step: confirm
+  if ! confirm "Create or update the lab environment in ${REGION}?"; then
+    info "Nothing changed."
+    exit 0
+  fi
+
+  # step: providers
+  step "Registering the resource providers used by the course"
+  local namespace state
+  for namespace in Microsoft.Compute Microsoft.Network Microsoft.Storage Microsoft.DevTestLab \
+    Microsoft.ContainerRegistry Microsoft.Consumption Microsoft.ContainerService Microsoft.RedHatOpenShift \
+    Microsoft.ManagedIdentity Microsoft.OperationalInsights; do
+    state="$(az provider show --namespace "$namespace" --query registrationState --output tsv 2>/dev/null || echo "NotRegistered")"
+    if [[ "$state" == "Registered" ]]; then
+      info "${namespace}: already registered"
+    else
+      info "${namespace}: registering (this can take a few minutes)"
+      az provider register --namespace "$namespace" --wait --output none
+    fi
+  done
+
+  # step: state
+  step "Storage for the Terraform state"
+  local state_rg state_account account_id user_id role_count ready="false"
+  state_rg="$(state_rg_name)"
+  state_account="$(state_account_name "$sub_id")"
+  az group create --tags "${COURSE_TAG_KEY}=${COURSE_TAG_VALUE}" "chapter=${SETUP_CHAPTER}" --name "$state_rg" --location "$REGION" --output none
+  if az storage account show --resource-group "$state_rg" --name "$state_account" --output none 2>/dev/null; then
+    info "Storage account ${state_account} already exists."
+  else
+    info "Creating storage account ${state_account} in ${state_rg}. Access needs Microsoft Entra ID, never an account key."
+    az storage account create --tags "${COURSE_TAG_KEY}=${COURSE_TAG_VALUE}" "chapter=${SETUP_CHAPTER}" \
+      --resource-group "$state_rg" --name "$state_account" --location "$REGION" \
+      --sku Standard_LRS --kind StorageV2 --min-tls-version TLS1_2 --https-only true \
+      --allow-blob-public-access false --allow-shared-key-access false --output none
+  fi
+  # Blob versioning keeps the earlier versions of the state, so a damaged state can be restored.
+  az storage account blob-service-properties update --resource-group "$state_rg" --account-name "$state_account" \
+    --enable-versioning true --output none
+  if [[ "$(az storage container-rm exists --resource-group "$state_rg" --storage-account "$state_account" \
+    --name "$STATE_CONTAINER" --query exists --output tsv)" != "true" ]]; then
+    az storage container-rm create --resource-group "$state_rg" --storage-account "$state_account" \
+      --name "$STATE_CONTAINER" --output none
+  fi
+  account_id="$(az storage account show --resource-group "$state_rg" --name "$state_account" --query id --output tsv)"
+  user_id="$(az ad signed-in-user show --query id --output tsv)"
+  role_count="$(az role assignment list --assignee "$user_id" --scope "$account_id" \
+    --role "Storage Blob Data Contributor" --query "length(@)" --output tsv)"
+  if [[ "$role_count" == "0" ]]; then
+    info "Giving your account the Storage Blob Data Contributor role on ${state_account}."
+    az role assignment create --assignee-object-id "$user_id" --assignee-principal-type User \
+      --role "Storage Blob Data Contributor" --scope "$account_id" --output none
+  fi
+  info "Waiting until your account can read the state container (a new role can take up to 10 minutes to apply)."
+  for _ in $(seq 1 60); do
+    if az storage blob list --account-name "$state_account" --container-name "$STATE_CONTAINER" \
+      --auth-mode login --num-results 1 --output none 2>/dev/null; then
+      ready="true"
+      break
+    fi
+    sleep 10
+  done
+  if [[ "$ready" != "true" ]]; then
+    die "Your account still cannot read the state container after 10 minutes. Wait a few minutes and run ./course up again."
+  fi
+  info "OK: the state of the setup goes to ${state_account}/${STATE_CONTAINER}/${SETUP_FOLDER}.tfstate."
+
+  # step: plan
+  step "Planning the lab environment with Terraform"
+  local contact_email infra_dir plan_file
+  contact_email="${BUDGET_CONTACT_EMAIL:-$(az account show --query user.name --output tsv)}"
+  if [[ "$contact_email" != *@* ]]; then
+    die "No e-mail address for budget alerts. Set BUDGET_CONTACT_EMAIL in .env."
+  fi
+  infra_dir="${COURSE_DIR}/setup/infra"
+  terraform_env "$SETUP_FOLDER" "$sub_id"
+  export_setup_tf_vars "$state_account" "$contact_email" "$ssh_public_key" "$kit_url"
+  plan_file="${TF_DATA_DIR}/lab.tfplan"
+  if ! terraform_init "$infra_dir" "$state_account" "${SETUP_FOLDER}.tfstate"; then
+    die "terraform init failed. Read the message above, fix the cause and run ./course up again."
+  fi
+  if ! terraform_in "$infra_dir" plan -out="$plan_file"; then
+    die "terraform plan failed. Read the message above, fix the cause and run ./course up again."
+  fi
+
+  # step: apply
+  if ! confirm "Apply this plan?"; then
+    info "The lab environment is unchanged. The state storage stays for the next run."
+    exit 0
+  fi
+  step "Applying the plan (about 3 minutes)"
+  if ! terraform_in "$infra_dir" apply "$plan_file"; then
+    die "terraform apply failed. Read the message above, fix the cause and run ./course up again."
+  fi
+  rm -f "$plan_file"
+  info "Terraform finished."
+}
+
+laptop_connect() {
+  # step: cmd-connect
+  laptop_preflight
+  require_cmd ssh "Install an OpenSSH client."
+  if [[ "$(vm_power_state)" != "PowerState/running" ]]; then
+    die "The lab VM is not running. Start it with: ./course up"
+  fi
+  lab_ssh
+}
+
+laptop_status() {
+  # step: cmd-status
+  laptop_preflight
+  local state
+  state="$(vm_power_state)"
+  info "Lab VM: $(vm_name) in $(rg_name)"
+  info "Power state: ${state:-not found}"
+  info "Public IP: $(vm_public_ip)"
+  info "Auto-shutdown: ${AUTO_SHUTDOWN_TIME} (${AUTO_SHUTDOWN_TIMEZONE})"
+}
+
+laptop_stop() {
+  # step: stop
+  laptop_preflight
+  step "Stopping (deallocating) the lab VM"
+  local power_state
+  power_state="$(vm_power_state)"
+  if [[ -z "$power_state" ]]; then
+    info "No lab VM found. Nothing to stop."
+  elif [[ "$power_state" == "PowerState/deallocated" ]]; then
+    info "The lab VM is already deallocated."
+  else
+    az vm deallocate --resource-group "$(rg_name)" --name "$(vm_name)" --output none
+    info "The lab VM is deallocated. Compute charges have stopped."
+  fi
+  info "Still charged while stopped: the OS disk ($(price_disk_month) ${CURRENCY} per month) and the public IP address ($(price_public_ip_hour) ${CURRENCY} per hour)."
+  info "Start the VM again with: ./course up"
+  # step: list
+  list_course_resources
+}
+
+laptop_destroy() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) ASSUME_YES=1 ;;
+      -h | --help)
+        laptop_usage
+        exit 0
+        ;;
+      *) die "Unknown option: ${arg}. Run: ./course help" ;;
+    esac
+  done
+  laptop_preflight
+  local rg sub_id state_account state_rg budget_url
+  rg="$(rg_name)"
+  state_rg="$(state_rg_name)"
+
+  # step: destroy-confirm
+  step "Destroying the lab environment"
+  info "This deletes resource group ${rg} with everything in it, budget $(budget_name),"
+  info "and resource group ${state_rg} with the Terraform state of the setup and of every lab."
+  info "Your work on the lab VM is lost. Copy anything you want to keep first."
+  if [[ "$ASSUME_YES" != "1" ]]; then
+    local typed=""
+    read -r -p "Type the prefix '${PREFIX}' to confirm: " typed || true
+    if [[ "$typed" != "$PREFIX" ]]; then
+      info "Nothing deleted."
+      exit 0
+    fi
+  fi
+
+  # step: destroy-terraform
+  step "Destroying the lab with Terraform"
+  sub_id="$(az account show --query id --output tsv)"
+  state_account="$(state_account_name "$sub_id")"
+  if ! command -v terraform >/dev/null 2>&1; then
+    info "Terraform is not installed. The steps below delete the lab with the Azure CLI."
+  elif ! az storage account show --resource-group "$state_rg" --name "$state_account" --output none 2>/dev/null; then
+    info "No Terraform state storage found. The steps below delete the lab with the Azure CLI."
+  else
+    # terraform destroy needs a value for every variable, even those it does not use.
+    local contact_email ssh_public_key="not-needed-to-destroy" kit_url infra_dir="${COURSE_DIR}/setup/infra"
+    contact_email="${BUDGET_CONTACT_EMAIL:-$(az account show --query user.name --output tsv)}"
+    if [[ -f "$(ssh_key_file).pub" ]]; then
+      ssh_public_key="$(tr -d '\r\n' <"$(ssh_key_file).pub")"
+    fi
+    kit_url="$(kit_repo_url)"
+    terraform_env "$SETUP_FOLDER" "$sub_id"
+    export_setup_tf_vars "$state_account" "$contact_email" "$ssh_public_key" "${kit_url:-https://example.invalid/not-needed-to-destroy}"
+    if terraform_init "$infra_dir" "$state_account" "${SETUP_FOLDER}.tfstate" &&
+      terraform_in "$infra_dir" destroy -auto-approve; then
+      info "Terraform destroyed the lab environment."
+    else
+      info "Terraform could not destroy everything. The steps below delete what is left with the Azure CLI."
+    fi
+  fi
+
+  # step: destroy-rg
+  if az group show --name "$rg" --output none 2>/dev/null; then
+    info "Deleting resource group ${rg} (5 to 10 minutes)."
+    az group delete --name "$rg" --yes --output none
+    info "Resource group deleted."
+  else
+    info "Resource group ${rg} does not exist."
+  fi
+
+  # step: destroy-budget
+  budget_url="https://management.azure.com/subscriptions/${sub_id}/providers/Microsoft.Consumption/budgets/$(budget_name)?api-version=2023-05-01"
+  if az rest --method get --url "$budget_url" --output none 2>/dev/null; then
+    az rest --method delete --url "$budget_url" --output none
+    info "Budget $(budget_name) deleted."
+  else
+    info "Budget $(budget_name) does not exist."
+  fi
+
+  # step: destroy-state
+  if az group show --name "$state_rg" --output none 2>/dev/null; then
+    info "Deleting resource group ${state_rg} with the Terraform state (a few minutes)."
+    az group delete --name "$state_rg" --yes --output none
+    info "Resource group deleted."
+  else
+    info "Resource group ${state_rg} does not exist."
+  fi
+  rm -rf "${HOME}/.aro-k8s/terraform/${SETUP_FOLDER}"
+
+  # step: destroy-known-hosts
+  rm -f "$(known_hosts_file)"
+  info "Azure may have created a resource group named NetworkWatcherRG when the network was created. It costs nothing on its own and you can keep it."
+
+  # step: list
+  list_course_resources
+}
+
+laptop_update() {
+  # step: update-kit
+  kit_update
+  # step: update-vm
+  load_env
+  if ! command -v az >/dev/null 2>&1 || ! az_signed_in; then
+    info "The Azure CLI is not signed in here, so the kit on the lab VM was not updated. On the lab VM, run: course update"
+    return 0
+  fi
+  require_expected_subscription
+  if [[ "$(vm_power_state)" != "PowerState/running" ]]; then
+    info "The lab VM is not running. Once it runs, update its kit from here with ./course update, or on the lab VM with: course update"
+    return 0
+  fi
+  step "Updating the kit on the lab VM"
+  if ! lab_ssh "git -C ~/${VM_COURSE_DIR} pull --ff-only"; then
+    die "git pull failed on the lab VM. Connect with ./course connect and look at: git -C ~/${VM_COURSE_DIR} status"
+  fi
+  lab_scp "${COURSE_ROOT}/.env" "${VM_COURSE_DIR}/.env"
+  info "Copied .env to ~/${VM_COURSE_DIR} on the lab VM. Your work in ~/work was not touched."
+}
+
+laptop_main() {
+  local command_name="$1"
+  shift
+  case "$command_name" in
+    up) laptop_up "$@" ;;
+    connect) laptop_connect ;;
+    status) laptop_status ;;
+    check)
+      # step: cmd-check
+      exec bash "${COURSE_DIR}/setup/check.sh" "$@"
+      ;;
+    stop) laptop_stop ;;
+    destroy) laptop_destroy "$@" ;;
+    update) laptop_update ;;
+    help | -h | --help) laptop_usage ;;
+    start | break | solution | clean)
+      die "course ${command_name} runs on the lab VM. Connect first with: ./course connect"
+      ;;
+    *)
+      laptop_usage
+      die "Unknown command: ${command_name}. The commands on your own computer are: ${LAPTOP_COMMANDS}"
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# On the lab VM
+# ---------------------------------------------------------------------------
+
+# Prints the folder names of the labs, for example: 01-containers 02-kubernetes-core
+lab_names() {
+  local dir names=""
+  for dir in "${COURSE_DIR}"/labs/*/; do
+    dir="${dir%/}"
+    names="${names} ${dir##*/}"
+  done
+  printf '%s' "${names# }"
+}
+
+# lab_dir COMMAND NN prints the folder of lab NN. NN can be 1, 01 or the folder name, such as 01-containers.
+lab_dir() {
+  local command_name="$1" wanted="${2:-}" number dir
+  if [[ ! "$wanted" =~ ^[0-9]{1,2}(-[a-z0-9-]+)?$ ]]; then
+    die "Give the number of a lab, for example: course ${command_name} 01. The labs are: $(lab_names)"
+  fi
+  number="${wanted%%-*}"
+  number="$(printf '%02d' "$((10#$number))")"
+  for dir in "${COURSE_DIR}"/labs/"${number}"-*/; do
+    if [[ -d "$dir" ]]; then
+      printf '%s' "${dir%/}"
+      return 0
+    fi
+  done
+  die "No lab ${number} in this kit. The labs are: $(lab_names). A newer kit may have it: course update"
+}
+
+# vm_run_lab SCRIPT COMMAND NN ARGS... runs one script of a lab with the remaining arguments.
+vm_run_lab() {
+  local script="$1" command_name="$2" dir
+  dir="$(lab_dir "$command_name" "${3:-}")"
+  shift 3 || shift $#
+  if [[ ! -f "${dir}/${script}" ]]; then
+    die "Lab ${dir##*/} has nothing for course ${command_name}."
+  fi
+  exec bash "${dir}/${script}" "$@"
+}
+
+# Copies the reference solution of a lab into ~/work/<lab folder>. Files it replaces are kept in ~/work/.backup.
+vm_solution() {
+  local dir name source_dir work_dir arg file relative replaced=0 backup
+  dir="$(lab_dir solution "${1:-}")"
+  shift || true
+  for arg in "$@"; do
+    case "$arg" in
+      --yes) ASSUME_YES=1 ;;
+      -h | --help)
+        vm_usage
+        exit 0
+        ;;
+      *) die "Unknown option: ${arg}. Run: course help" ;;
+    esac
+  done
+  name="${dir##*/}"
+  source_dir="${COURSE_DIR}/solutions/${name}"
+  work_dir="${HOME}/work/${name}"
+  if [[ ! -d "$source_dir" ]]; then
+    die "Lab ${name} has no reference solution."
+  fi
+  if [[ ! -d "$work_dir" ]]; then
+    die "${work_dir} does not exist yet. Set the lab up first: course start ${name%%-*}"
+  fi
+
+  step "Reference solution of lab ${name}"
+  info "Try the lab on your own first. The solution is one way to pass the checks, not the only one."
+  info "This copies these files into ${work_dir}:"
+  while IFS= read -r file; do
+    relative="${file#"${source_dir}"/}"
+    if [[ -e "${work_dir}/${relative}" ]]; then
+      info "  ${relative}, which replaces your own file"
+      replaced=$((replaced + 1))
+    else
+      info "  ${relative}"
+    fi
+  done < <(find "$source_dir" -type f | sort)
+  backup="${HOME}/work/.backup/${name}-$(date +%Y%m%d-%H%M%S)"
+  if ((replaced > 0)); then
+    info "Your files are copied to ${backup} first."
+  fi
+  if ! confirm "Copy the reference solution?"; then
+    info "Nothing changed."
+    exit 0
+  fi
+  while IFS= read -r file; do
+    relative="${file#"${source_dir}"/}"
+    if [[ -e "${work_dir}/${relative}" ]]; then
+      mkdir -p "$(dirname "${backup}/${relative}")"
+      cp -p "${work_dir}/${relative}" "${backup}/${relative}"
+    fi
+    mkdir -p "$(dirname "${work_dir}/${relative}")"
+    cp "$file" "${work_dir}/${relative}"
+  done < <(find "$source_dir" -type f | sort)
+  info "Done. The solution page of the course explains each choice and gives the commands in order."
+  info "Check the result with: course check ${name%%-*}"
+}
+
+vm_main() {
+  local command_name="$1"
+  shift
+  case "$command_name" in
+    start) vm_run_lab setup.sh start "$@" ;;
+    check) vm_run_lab validate.sh check "$@" ;;
+    break) vm_run_lab break.sh break "$@" ;;
+    clean) vm_run_lab teardown.sh clean "$@" ;;
+    solution) vm_solution "$@" ;;
+    update)
+      kit_update
+      info "Your work in ~/work is not part of the kit and was not touched."
+      ;;
+    help | -h | --help) vm_usage ;;
+    up | connect | status | stop | destroy)
+      die "course ${command_name} runs on your own computer, from the kit folder: ./course ${command_name} (.\\course.ps1 ${command_name} in PowerShell)"
+      ;;
+    *)
+      vm_usage
+      die "Unknown command: ${command_name}. The commands on the lab VM are: ${VM_COMMANDS}"
+      ;;
+  esac
+}
+
+if [[ "$#" -eq 0 ]]; then
+  set -- help
+fi
+if on_lab_vm; then
+  vm_main "$@"
+else
+  laptop_main "$@"
+fi

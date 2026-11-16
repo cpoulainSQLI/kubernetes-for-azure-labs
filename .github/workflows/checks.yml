@@ -1,0 +1,57 @@
+# Runs the checks of the kit on every push and pull request. Read its result before you rely on a change.
+# The website runs its own checks against this kit before each deployment.
+name: Kit checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the kit
+        uses: actions/checkout@v7
+
+      - name: Shell scripts
+        run: shellcheck -x course setup/*.sh labs/*/*.sh lib/*.sh
+
+      - name: PowerShell scripts
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+          $findings = Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+          $findings | Format-Table -AutoSize
+          if ($findings) { exit 1 }
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.2
+          terraform_wrapper: false
+
+      - name: Terraform format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform validate
+        run: |
+          for dir in setup/infra labs/*/infra; do
+            terraform -chdir="$dir" init -backend=false -input=false > /dev/null
+            terraform -chdir="$dir" validate
+          done
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: sample-app/go.mod
+
+      - name: Sample app
+        working-directory: sample-app
+        run: go vet ./... && go test ./...
+
+      - name: Kit rules, versions, parity and tags
+        run: python3 tools/check-kit.py

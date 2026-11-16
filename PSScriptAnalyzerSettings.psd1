@@ -1,11 +1,11 @@
-# PSScriptAnalyzer settings for the course scripts.
-# Run from the course root: Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
+# PSScriptAnalyzer settings for the PowerShell scripts of the kit.
+# Run from the kit folder: Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
 @{
     Severity     = @('Error', 'Warning', 'Information')
     ExcludeRules = @(
         # The scripts are interactive console tools that print coloured PASS, FAIL and WARN lines.
         'PSAvoidUsingWriteHost',
-        # scripts/lib.ps1 defines variables for the scripts that dot-source it.
+        # lib/lib.ps1 defines variables for the scripts that dot-source it.
         'PSUseDeclaredVarsMoreThanAssignments'
     )
     Rules        = @{

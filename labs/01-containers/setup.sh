@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Lab 01 setup. Creates the chapter registry and copies the sample app to ~/work.
+# Run it on the lab VM:
+#   course start 01 [--yes]
+# Safe to run again.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=../../lib/lib.sh
+source "${SCRIPT_DIR}/../../lib/lib.sh"
+
+CHAPTER="01"
+WORK_DIR="${HOME}/work/01-containers"
+
+for arg in "$@"; do
+  case "$arg" in
+    --yes) ASSUME_YES=1 ;;
+    -h | --help)
+      echo "Usage: course start 01 [--yes]"
+      echo "Creates a Basic Azure Container Registry for chapter 1 and copies the sample app to ${WORK_DIR}."
+      exit 0
+      ;;
+    *) die "Unknown option: ${arg}. Run with --help." ;;
+  esac
+done
+
+require_lab_vm
+load_env
+require_cmd docker "Docker should be on the lab VM. Run the readiness report from your own computer: ./course check"
+require_cmd az "The Azure CLI should be on the lab VM. Run the readiness report from your own computer: ./course check"
+require_cmd terraform "Terraform should be on the lab VM. Run the readiness report from your own computer: ./course check"
+
+if ! docker info >/dev/null 2>&1; then
+  die "Docker does not answer. If course up just finished, disconnect and reconnect so your docker group membership applies."
+fi
+
+step "Signing in to Azure"
+ensure_vm_identity_login
+require_expected_subscription
+info "Signed in as the lab VM's managed identity."
+
+step "Estimated cost"
+info "Basic registry: $(price_acr_basic_day) ${CURRENCY} per day while it exists, 10 GiB of storage included."
+info "course clean 01 deletes it at the end of the chapter."
+if ! confirm "Create or update the chapter 1 registry in $(rg_name)?"; then
+  info "Nothing changed."
+  exit 0
+fi
+
+step "Creating the registry with Terraform (about a minute)"
+sub_id="$(az account show --query id --output tsv)"
+tenant_id="$(az account show --query tenantId --output tsv)"
+infra_dir="${SCRIPT_DIR}/infra"
+terraform_env "01-containers" "$sub_id"
+# Terraform signs in with the lab VM's managed identity, like the Azure CLI above.
+export ARM_USE_MSI=true ARM_TENANT_ID="$tenant_id"
+lab_rg="$(rg_name)"
+export TF_VAR_prefix="$PREFIX" TF_VAR_resource_group_name="$lab_rg" TF_VAR_chapter="$CHAPTER"
+if ! terraform_init "$infra_dir" "$(state_account_name "$sub_id")" "01-containers.tfstate"; then
+  die "terraform init failed. Check that course up finished on your own computer, then run course start 01 again."
+fi
+if ! terraform_in "$infra_dir" apply -auto-approve; then
+  die "terraform apply failed. Read the message above, fix the cause and run this script again."
+fi
+login_server="$(terraform_in "$infra_dir" output -raw login_server)"
+info "Registry ready: ${login_server}"
+
+step "Copying the sample app to ${WORK_DIR}"
+mkdir -p "$WORK_DIR"
+if [[ -d "${WORK_DIR}/sample-app" ]]; then
+  info "${WORK_DIR}/sample-app already exists. Kept as it is."
+else
+  cp -r "${COURSE_ROOT}/sample-app" "${WORK_DIR}/sample-app"
+  info "Copied."
+fi
+
+step "Done"
+info "Setup took $(duration_text "$SECONDS")."
+info "Registry login server: ${login_server}"
+info "Your working folder: ${WORK_DIR}/sample-app"
+info "Next: do the lab tasks of the chapter 1 page. The guided check follows you task by task:"
+info "  course check 01 --guided"
+info "At the end, the full report:"
+info "  course check 01"

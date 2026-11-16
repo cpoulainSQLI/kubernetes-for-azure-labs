@@ -1,18 +1,20 @@
-# Scripts and config files must keep Unix line endings, even on Windows,
-# because they run on the Linux lab VM.
+# Scripts and config files keep Unix line endings, even in a clone on Windows,
+# because they run on the Linux lab VM and in Git Bash.
 * text=auto
+course text eol=lf
 *.sh text eol=lf
+*.ps1 text eol=lf
+*.psd1 text eol=lf
+*.py text eol=lf
 *.tf text eol=lf
 *.hcl text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf
 *.go text eol=lf
+*.mod text eol=lf
 *.md text eol=lf
-*.html text eol=lf
-*.css text eol=lf
-*.js text eol=lf
-*.ps1 text eol=lf
-*.psd1 text eol=lf
-*.png binary
 .env* text eol=lf
+.shellcheckrc text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
 Dockerfile text eol=lf
