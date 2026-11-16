@@ -1,0 +1,34 @@
+# Reference solution for the chapter 2 lab. Try the lab on your own first.
+# Final state of the lab: 5 replicas running version 1.0.0.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  namespace: sample-app
+  labels:
+    app.kubernetes.io/name: sample-app
+    app.kubernetes.io/part-of: aro-k8s-course
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sample-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: sample-app
+    spec:
+      containers:
+        - name: sample-app
+          image: sample-app:1.0.0
+          # The image only exists inside the kind nodes (kind load), never pull it.
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          # Stretch goal: only send traffic to a pod once /healthz answers.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5

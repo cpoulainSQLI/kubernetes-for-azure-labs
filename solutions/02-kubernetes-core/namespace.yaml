@@ -1,0 +1,7 @@
+# Reference solution for the chapter 2 lab. Try the lab on your own first.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-app
+  labels:
+    app.kubernetes.io/part-of: aro-k8s-course

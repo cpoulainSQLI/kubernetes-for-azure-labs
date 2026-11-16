@@ -1,0 +1,30 @@
+# Learner settings stay on the learner's machine.
+.env
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build output from the sample app
+sample-app/sample-app
+
+# Tools used by the checks
+node_modules/
+__pycache__/
+
+# Terraform working files. The lab scripts keep them in ~/.aro-k8s, but the checks run terraform init here.
+# The state lives in Azure Storage, so a state file here would be a mistake: Git ignores it to keep it private.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Notes passed from one working session to the next, and the local instructions and working files of a coding agent.
+# They stay on the author's machine.
+handoff/
+CLAUDE.md
+CLAUDE.local.md
+.claude/
