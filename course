@@ -183,6 +183,21 @@ laptop_up() {
   info "  ./course connect"
 }
 
+# Does with the state container what Terraform does with its state: writes a blob, then locks it with a lease.
+# The blob access-check stays in the container, so later runs only take and release the lease and add no blob version.
+state_access_ok() {
+  local account="$1" blob="access-check" exists lease_id
+  local where=(--account-name "$account" --container-name "$STATE_CONTAINER" --auth-mode login)
+  exists="$(az storage blob exists --name "$blob" "${where[@]}" --query exists --output tsv 2>/dev/null)" || return 1
+  if [[ "$exists" != "true" ]]; then
+    az storage blob upload --name "$blob" --data "course up access check" "${where[@]}" \
+      --only-show-errors --output none 2>/dev/null || return 1
+  fi
+  lease_id="$(az storage blob lease acquire --blob-name "$blob" --lease-duration 15 "${where[@]}" --output tsv 2>/dev/null)" || return 1
+  [[ -n "$lease_id" ]] || return 1
+  az storage blob lease release --blob-name "$blob" --lease-id "$lease_id" "${where[@]}" --output none 2>/dev/null
+}
+
 # Creates or updates the lab environment with Terraform: the state storage first, then the configuration in setup/infra.
 up_with_terraform() {
   local ssh_public_key="$1" kit_url="$2"
@@ -264,7 +279,7 @@ up_with_terraform() {
 
   # step: state
   step "Storage for the Terraform state"
-  local state_rg state_account account_id user_id role_count ready="false"
+  local state_rg state_account account_id user_id role_count
   state_rg="$(state_rg_name)"
   state_account="$(state_account_name "$sub_id")"
   az group create --tags "${COURSE_TAG_KEY}=${COURSE_TAG_VALUE}" "chapter=${SETUP_CHAPTER}" --name "$state_rg" --location "$REGION" --output none
@@ -289,22 +304,23 @@ up_with_terraform() {
   user_id="$(az ad signed-in-user show --query id --output tsv)"
   role_count="$(az role assignment list --assignee "$user_id" --scope "$account_id" \
     --role "Storage Blob Data Contributor" --query "length(@)" --output tsv)"
+  # A new role reaches the storage servers one by one, so one good test proves little. After a grant, the test
+  # has to pass three times in a row before Terraform runs.
+  local needed=1 passes=0 deadline
   if [[ "$role_count" == "0" ]]; then
     info "Giving your account the Storage Blob Data Contributor role on ${state_account}."
     az role assignment create --assignee-object-id "$user_id" --assignee-principal-type User \
       --role "Storage Blob Data Contributor" --scope "$account_id" --output none
+    needed=3
   fi
-  info "Waiting until your account can read the state container (a new role can take up to 10 minutes to apply)."
-  for _ in $(seq 1 60); do
-    if az storage blob list --account-name "$state_account" --container-name "$STATE_CONTAINER" \
-      --auth-mode login --num-results 1 --output none 2>/dev/null; then
-      ready="true"
-      break
-    fi
-    sleep 10
+  info "Waiting until your account can write to the state container (a new role can take up to 10 minutes to apply)."
+  deadline=$((SECONDS + 600))
+  while (( passes < needed && SECONDS < deadline )); do
+    if state_access_ok "$state_account"; then passes=$((passes + 1)); else passes=0; fi
+    if (( passes < needed )); then sleep 10; fi
   done
-  if [[ "$ready" != "true" ]]; then
-    die "Your account still cannot read the state container after 10 minutes. Wait a few minutes and run ./course up again."
+  if (( passes < needed )); then
+    die "Your account still cannot write to the state container after 10 minutes. Wait a few minutes and run ./course up again."
   fi
   info "OK: the state of the setup goes to ${state_account}/${STATE_CONTAINER}/${SETUP_FOLDER}.tfstate."
 
@@ -320,7 +336,8 @@ up_with_terraform() {
   export_setup_tf_vars "$state_account" "$contact_email" "$ssh_public_key" "$kit_url"
   plan_file="${TF_DATA_DIR}/lab.tfplan"
   if ! terraform_init "$infra_dir" "$state_account" "${SETUP_FOLDER}.tfstate"; then
-    die "terraform init failed. Read the message above, fix the cause and run ./course up again."
+    die "terraform init failed. If the message above shows a 403 error, your role on the state storage is not active everywhere yet." \
+      "Wait 10 minutes and run ./course up again. Otherwise fix the cause shown above and run ./course up again."
   fi
   if ! terraform_in "$infra_dir" plan -out="$plan_file"; then
     die "terraform plan failed. Read the message above, fix the cause and run ./course up again."

@@ -76,6 +76,24 @@ function Invoke-KitUpdate {
 # up
 # ---------------------------------------------------------------------------
 
+# Does with the state container what Terraform does with its state: writes a blob, then locks it with a lease.
+# The blob access-check stays in the container, so later runs only take and release the lease and add no blob version.
+function Test-StateAccess([string]$Account) {
+    $blob = 'access-check'
+    $where = @('--account-name', $Account, '--container-name', $StateContainer, '--auth-mode', 'login')
+    $exists = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'exists', '--name', $blob, '--query', 'exists', '--output', 'tsv') + $where)
+    if ($exists.ExitCode -ne 0) { return $false }
+    if ($exists.Output -ne 'true') {
+        $upload = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'upload', '--name', $blob, '--data', 'course up access check',
+                '--only-show-errors', '--output', 'none') + $where)
+        if ($upload.ExitCode -ne 0) { return $false }
+    }
+    $lease = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'lease', 'acquire', '--blob-name', $blob, '--lease-duration', '15', '--output', 'tsv') + $where)
+    if ($lease.ExitCode -ne 0 -or -not $lease.Output) { return $false }
+    $release = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'lease', 'release', '--blob-name', $blob, '--lease-id', $lease.Output, '--output', 'none') + $where)
+    return ($release.ExitCode -eq 0)
+}
+
 # Creates or updates the lab environment with Terraform: the state storage first, then the configuration in setup/infra.
 function Invoke-UpWithTerraform([string]$SshPublicKey, [string]$KitUrl, [bool]$AssumeYes) {
     Assert-Terraform
@@ -180,20 +198,23 @@ function Invoke-UpWithTerraform([string]$SshPublicKey, [string]$KitUrl, [bool]$A
     $roleCheck = Invoke-Native -FilePath 'az' -Arguments @('role', 'assignment', 'list', '--assignee', $userId, '--scope', $accountId,
         '--role', 'Storage Blob Data Contributor', '--query', '[].id', '--output', 'tsv', '--only-show-errors')
     if ($roleCheck.ExitCode -ne 0) { Exit-WithError 'Could not read the role assignments of the state storage account. Run az login, then .\course.ps1 up again.' }
+    # A new role reaches the storage servers one by one, so one good test proves little. After a grant, the test
+    # has to pass three times in a row before Terraform runs.
+    $needed = 1
     if (-not $roleCheck.Output) {
         Write-Info "Giving your account the Storage Blob Data Contributor role on $stateAccount."
         Invoke-AzChange @('role', 'assignment', 'create', '--assignee-object-id', $userId, '--assignee-principal-type', 'User',
             '--role', 'Storage Blob Data Contributor', '--scope', $accountId) 'Giving your account access to the state'
+        $needed = 3
     }
-    Write-Info 'Waiting until your account can read the state container (a new role can take up to 10 minutes to apply).'
-    $ready = $false
-    for ($attempt = 1; $attempt -le 60; $attempt++) {
-        $probe = Invoke-Native -FilePath 'az' -Arguments @('storage', 'blob', 'list', '--account-name', $stateAccount, '--container-name', $StateContainer,
-            '--auth-mode', 'login', '--num-results', '1', '--output', 'none')
-        if ($probe.ExitCode -eq 0) { $ready = $true; break }
-        Start-Sleep -Seconds 10
+    Write-Info 'Waiting until your account can write to the state container (a new role can take up to 10 minutes to apply).'
+    $deadline = (Get-Date).AddMinutes(10)
+    $passes = 0
+    while ($passes -lt $needed -and (Get-Date) -lt $deadline) {
+        if (Test-StateAccess $stateAccount) { $passes++ } else { $passes = 0 }
+        if ($passes -lt $needed) { Start-Sleep -Seconds 10 }
     }
-    if (-not $ready) { Exit-WithError 'Your account still cannot read the state container after 10 minutes. Wait a few minutes and run .\course.ps1 up again.' }
+    if ($passes -lt $needed) { Exit-WithError 'Your account still cannot write to the state container after 10 minutes. Wait a few minutes and run .\course.ps1 up again.' }
     Write-Info "OK: the state of the setup goes to $stateAccount/$StateContainer/$SetupFolder.tfstate."
 
     # step: plan
@@ -207,7 +228,8 @@ function Invoke-UpWithTerraform([string]$SshPublicKey, [string]$KitUrl, [bool]$A
     Export-SetupTerraformVariable $stateAccount $contactEmail $SshPublicKey $KitUrl
     $planFile = Join-Path $env:TF_DATA_DIR 'lab.tfplan'
     if ((Invoke-Terraform $infraDir (Get-TerraformInitArgument $stateAccount "$SetupFolder.tfstate")) -ne 0) {
-        Exit-WithError 'terraform init failed. Read the message above, fix the cause and run .\course.ps1 up again.'
+        Exit-WithError ('terraform init failed. If the message above shows a 403 error, your role on the state storage is not active everywhere yet. ' +
+            'Wait 10 minutes and run .\course.ps1 up again. Otherwise fix the cause shown above and run .\course.ps1 up again.')
     }
     if ((Invoke-Terraform $infraDir @('plan', "-out=$planFile")) -ne 0) {
         Exit-WithError 'terraform plan failed. Read the message above, fix the cause and run .\course.ps1 up again.'
