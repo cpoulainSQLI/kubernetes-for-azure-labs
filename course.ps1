@@ -27,7 +27,7 @@ With up: run Terraform even when the lab VM exists, to apply a change made to .e
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('up', 'connect', 'status', 'check', 'stop', 'destroy', 'update', 'help', 'start', 'break', 'solution', 'clean')]
+    [ValidateSet('up', 'connect', 'ssh-config', 'status','check', 'stop', 'destroy', 'update', 'help', 'start', 'break', 'solution', 'clean')]
     [string]$Command = 'help',
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest,
     [switch]$Yes,
@@ -42,6 +42,7 @@ function Show-Usage {
     Write-Info '  .\course.ps1 up [-Yes] [-Apply]   create the lab environment, or start the lab VM if it exists.'
     Write-Info '                                    -Apply also applies a change made to .env. Safe to run twice.'
     Write-Info '  .\course.ps1 connect              open an SSH session on the lab VM (type exit to leave)'
+    Write-Info '  .\course.ps1 ssh-config           print the SSH settings of the lab VM, for VS Code Remote - SSH'
     Write-Info '  .\course.ps1 status               show the power state, the IP address and the shutdown time'
     Write-Info '  .\course.ps1 check                readiness report of the lab environment. Changes nothing.'
     Write-Info '  .\course.ps1 stop                 deallocate the lab VM. Your work on it is kept.'
@@ -346,6 +347,30 @@ function Invoke-Connect {
     Enter-LabSsh
 }
 
+# Prints a Host block for ~/.ssh/config, so that VS Code Remote - SSH (or plain ssh) reaches the lab VM with the
+# same key, user and known hosts file as course connect. Every line is valid in ~/.ssh/config, comments included.
+# The lines go to the output stream, so .\course.ps1 ssh-config | Set-Clipboard copies them.
+function Invoke-SshConfig {
+    # step: cmd-ssh-config
+    Initialize-Laptop
+    $ip = Get-VmPublicIp
+    if (-not $ip) { Exit-WithError 'No public IP found for the lab VM. Create it first with: .\course.ps1 up' }
+    # OpenSSH on Windows reads forward slashes, and ~ stands for the user profile.
+    $key = "$($Config.SSH_KEY_PATH)" -replace '\\', '/'
+    if ($key.Contains(' ')) { $key = "`"$key`"" }
+    $vm = Get-VmName
+    Write-Output '# Lab VM of the course. Paste these lines into ~/.ssh/config, then in VS Code run'
+    Write-Output "# `"Remote-SSH: Connect to Host...`" and pick $vm. The IP address changes only after course destroy."
+    if ((Get-PowerState) -ne 'PowerState/running') {
+        Write-Output '# The lab VM is not running. Start it with .\course.ps1 up before you connect.'
+    }
+    Write-Output "Host $vm"
+    Write-Output "    HostName $ip"
+    Write-Output "    User $($Config.ADMIN_USERNAME)"
+    Write-Output "    IdentityFile $key"
+    Write-Output '    UserKnownHostsFile ~/.ssh/aro-k8s_known_hosts'
+}
+
 function Invoke-Status {
     # step: cmd-status
     Initialize-Laptop
@@ -501,6 +526,7 @@ function Invoke-Update {
 switch ($Command) {
     'up' { Invoke-Up $Yes.IsPresent $Apply.IsPresent }
     'connect' { Invoke-Connect }
+    'ssh-config' { Invoke-SshConfig }
     'status' { Invoke-Status }
     'check' {
         # step: cmd-check

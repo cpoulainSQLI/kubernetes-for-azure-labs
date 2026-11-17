@@ -10,7 +10,7 @@ COURSE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${COURSE_DIR}/lib/lib.sh"
 
 # The commands of each side. tools/check-kit.py and the checker of the website read these two lines.
-LAPTOP_COMMANDS="up connect status check stop destroy update help"
+LAPTOP_COMMANDS="up connect ssh-config status check stop destroy update help"
 VM_COMMANDS="start check break solution clean update help"
 
 laptop_usage() {
@@ -19,7 +19,8 @@ Usage on your own computer, from the kit folder (.\course.ps1 in PowerShell):
   ./course up [--yes] [--apply]   create the lab environment, or start the lab VM if it exists.
                                   --apply also applies a change made to .env. Safe to run twice.
   ./course connect                open an SSH session on the lab VM (type exit to leave)
-  ./course status                 show the power state, the IP address and the shutdown time
+  ./course ssh-config             print the SSH settings of the lab VM, for VS Code Remote - SSH
+  ./course status                show the power state, the IP address and the shutdown time
   ./course check                  readiness report of the lab environment. Changes nothing.
   ./course stop                   deallocate the lab VM. Your work on it is kept.
   ./course destroy [--yes]        delete the lab environment and the Terraform state
@@ -366,6 +367,32 @@ laptop_connect() {
   lab_ssh
 }
 
+# Prints a Host block for ~/.ssh/config, so that VS Code Remote - SSH (or plain ssh) reaches the lab VM with the
+# same key, user and known hosts file as course connect. Every line is valid in ~/.ssh/config, comments included.
+laptop_ssh_config() {
+  # step: cmd-ssh-config
+  laptop_preflight
+  local ip key
+  ip="$(vm_public_ip)"
+  if [[ -z "$ip" ]]; then
+    die "No public IP found for the lab VM. Create it first with: ./course up"
+  fi
+  key="$SSH_KEY_PATH"
+  # A path that does not start with ~ is written the way Windows programs read it when this runs in Git Bash.
+  if [[ "$key" != "~"* ]]; then key="$(native_path "$key")"; fi
+  if [[ "$key" == *" "* ]]; then key="\"${key}\""; fi
+  info "# Lab VM of the course. Paste these lines into ~/.ssh/config, then in VS Code run"
+  info "# \"Remote-SSH: Connect to Host...\" and pick $(vm_name). The IP address changes only after course destroy."
+  if [[ "$(vm_power_state)" != "PowerState/running" ]]; then
+    info "# The lab VM is not running. Start it with ./course up before you connect."
+  fi
+  info "Host $(vm_name)"
+  info "    HostName ${ip}"
+  info "    User ${ADMIN_USERNAME}"
+  info "    IdentityFile ${key}"
+  info "    UserKnownHostsFile ~/.ssh/aro-k8s_known_hosts"
+}
+
 laptop_status() {
   # step: cmd-status
   laptop_preflight
@@ -518,6 +545,7 @@ laptop_main() {
   case "$command_name" in
     up) laptop_up "$@" ;;
     connect) laptop_connect ;;
+    ssh-config) laptop_ssh_config ;;
     status) laptop_status ;;
     check)
       # step: cmd-check

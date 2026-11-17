@@ -47,6 +47,7 @@ On your own computer, from the kit folder. In PowerShell, write `.\course.ps1` i
 |---|---|
 | `./course up [--yes] [--apply]` | Creates the lab environment, or starts the lab VM when it exists. Safe to run twice. `--apply` also applies a change made to `.env` |
 | `./course connect` | Opens an SSH session on the lab VM |
+| `./course ssh-config` | Prints the SSH settings of the lab VM, to paste into `~/.ssh/config` for VS Code Remote - SSH |
 | `./course status` | Shows the power state, the IP address and the shutdown time of the lab VM |
 | `./course check` | Readiness report of the lab environment. It changes nothing |
 | `./course stop` | Deallocates the lab VM. The compute charges stop and your work stays |

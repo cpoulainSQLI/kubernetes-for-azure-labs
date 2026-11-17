@@ -278,7 +278,7 @@ def course_commands():
     text = read("course")
     sides = {}
     for side in ("LAPTOP", "VM"):
-        match = re.search(rf'^{side}_COMMANDS="([a-z ]+)"$', text, re.MULTILINE)
+        match = re.search(rf'^{side}_COMMANDS="([a-z -]+)"$', text, re.MULTILINE)
         sides[side] = set(match.group(1).split()) if match else set()
     return sides
 
@@ -290,10 +290,10 @@ def check_course_command():
         if not commands:
             errors.append(f"course: no {side}_COMMANDS line")
         for command in commands:
-            if not re.search(rf"^\s+[a-z| -]*\b{command}\b[a-z| -]*\)", text, re.MULTILINE):
+            if not re.search(rf"^\s+[a-z| -]*\b{re.escape(command)}\b[a-z| -]*\)", text, re.MULTILINE):
                 errors.append(f"course: {side.lower()} command '{command}' has no branch in its case statement")
     accepted = re.search(r"\[ValidateSet\(([^)]*)\)\]", read("course.ps1"))
-    accepted = set(re.findall(r"'([a-z]+)'", accepted.group(1))) if accepted else set()
+    accepted = set(re.findall(r"'([a-z-]+)'", accepted.group(1))) if accepted else set()
     for command in sides["LAPTOP"] - accepted:
         errors.append(f"course.ps1: the command '{command}' is missing from its ValidateSet")
 
