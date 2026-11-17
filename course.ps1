@@ -174,8 +174,13 @@ function Invoke-UpWithTerraform([string]$SshPublicKey, [string]$KitUrl, [bool]$A
     }
     $accountId = Get-AzValue @('storage', 'account', 'show', '--resource-group', $stateRg, '--name', $stateAccount, '--query', 'id')
     $userId = Get-AzValue @('ad', 'signed-in-user', 'show', '--query', 'id')
-    $roleCount = Get-AzValue @('role', 'assignment', 'list', '--assignee', $userId, '--scope', $accountId, '--role', 'Storage Blob Data Contributor', '--query', 'length(@)')
-    if ($roleCount -eq '0') {
+    if (-not $accountId -or -not $userId) { Exit-WithError 'Could not read the state storage account or your account in Microsoft Entra ID. Run az login, then .\course.ps1 up again.' }
+    # az is a batch file on Windows, and cmd.exe rejects a query such as length(@), so the script lists the IDs and
+    # counts them. A failed lookup stops the script here, instead of skipping the grant and waiting 10 minutes for nothing.
+    $roleCheck = Invoke-Native -FilePath 'az' -Arguments @('role', 'assignment', 'list', '--assignee', $userId, '--scope', $accountId,
+        '--role', 'Storage Blob Data Contributor', '--query', '[].id', '--output', 'tsv', '--only-show-errors')
+    if ($roleCheck.ExitCode -ne 0) { Exit-WithError 'Could not read the role assignments of the state storage account. Run az login, then .\course.ps1 up again.' }
+    if (-not $roleCheck.Output) {
         Write-Info "Giving your account the Storage Blob Data Contributor role on $stateAccount."
         Invoke-AzChange @('role', 'assignment', 'create', '--assignee-object-id', $userId, '--assignee-principal-type', 'User',
             '--role', 'Storage Blob Data Contributor', '--scope', $accountId) 'Giving your account access to the state'

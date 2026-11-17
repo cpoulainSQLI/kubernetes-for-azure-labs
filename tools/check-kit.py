@@ -11,7 +11,7 @@ Checks:
   3. The pinned kind, kubectl and Terraform versions agree across files.
   4. The bash and PowerShell versions of the commands for your own computer (course and
      course.ps1, setup/check.sh and setup/check.ps1) have the same "# check:" and "# step:" IDs,
-     and PowerShell files are plain ASCII.
+     PowerShell files are plain ASCII, and they pass az no query that cmd.exe breaks, such as length(@).
   5. Each lab has its setup, validation and teardown scripts, a validator has one check function
      and one task text per stage, and a broken lab has the functions of each fault.
   6. The course command lists its commands, and course.ps1 accepts every command for your computer.
@@ -192,6 +192,18 @@ def check_script_tags(path, text):
             word in stripped for word in ("'deployment'", "'assignment'", "'container-rm'")
         ):
             report(path, number, "az create call without '--tags'")
+
+
+# On Windows az is a batch file, so cmd.exe reads its arguments again. PowerShell quotes an argument only when it
+# holds a space, and cmd.exe rejects an unquoted one with parentheses or &|<>^, such as length(@).
+CMD_SPECIAL_QUERY = re.compile(r"""'--query',\s*(['"])([^'"\s]*[()&|<>^][^'"\s]*)\1""")
+
+
+def check_powershell_queries(path, text):
+    for number, line in enumerate(text.splitlines(), start=1):
+        match = CMD_SPECIAL_QUERY.search(line)
+        if match and not line.strip().startswith("#"):
+            report(path, number, f"az query {match.group(2)} has a cmd.exe character and no space: az.cmd breaks on it")
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +402,8 @@ def main():
             check_terraform_tags(path, text)
         if is_bash(path) or path.suffix == ".ps1":
             check_script_tags(path, text)
+        if path.suffix == ".ps1":
+            check_powershell_queries(path, text)
         if path.suffix in {".ps1", ".psd1"} and not text.isascii():
             # Windows PowerShell 5.1 reads files without a byte order mark as ANSI, not UTF-8.
             report(path, 1, "non-ASCII character in a PowerShell file")
