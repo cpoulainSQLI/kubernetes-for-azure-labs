@@ -71,7 +71,7 @@ function Invoke-Up([bool]$AssumeYes) {
 
     $kitRef = Get-KitRef $kitUrl
     $cloned = $kitUrl
-    if ($kitRef) { $cloned = "$kitUrl, at $kitRef" }
+    if ($kitRef) { $cloned = "$kitUrl at $kitRef," }
 
     # step: tools
     Write-Step "The WSL distribution $DistroName"
@@ -85,7 +85,7 @@ function Invoke-Up([bool]$AssumeYes) {
         Write-Info "  - installs Docker Engine, kubectl $PinnedKubectlMinor, kind $PinnedKindVersion, git, curl, jq and python3-yaml (setup/install-tools.sh),"
         Write-Info "  - clones the kit from $cloned into ~/$KitName and puts the course command on its PATH."
         Write-Info "It writes the instructions for cloud-init to $userData."
-        Write-Info 'It takes a few minutes and about 8 GB of disk. Nothing changes on Windows itself, and Docker Desktop is not needed.'
+        Write-Info 'It takes a few minutes and about 8 GB of disk. Apart from that file, nothing changes on Windows, and Docker Desktop is not needed.'
         if (-not (Confirm-Action "Create the distribution ${DistroName}?" $AssumeYes)) {
             Write-Info 'Nothing changed.'
             exit 0
