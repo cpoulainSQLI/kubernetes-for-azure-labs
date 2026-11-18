@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chapter 1 validation. Run it on the lab VM:
+# Chapter 1 validation. Run it in the environment of the course:
 #   course check 01            full report
 #   course check 01 --guided   one stage at a time
 # Read-only: it reads your Dockerfile, inspects Docker and the registry, and sends GET requests.
@@ -31,19 +31,12 @@ STAGE_TITLES=(
   "Run the container"
   "Push the image to the registry"
 )
-DEEP_NOTICE="they start a temporary container from your image, call it, stop it and remove it. Your own container, your image and Azure are not touched."
+DEEP_NOTICE="they start a temporary container from your image, call it, stop it and remove it. Your own container, your image and the registry are not touched."
 
 preflight() {
-  require_lab_vm
-  load_env
-  require_cmd docker "Run the readiness report from your own computer: ./course check"
   require_cmd curl
   require_cmd jq
-  if ! docker info >/dev/null 2>&1; then
-    check_fail "Docker does not answer." "Disconnect and reconnect to the VM, then try again."
-    check_summary
-    exit 1
-  fi
+  require_docker
 }
 
 # ---------------------------------------------------------------------------
@@ -333,7 +326,7 @@ stage_2() {
 stage_3_task() {
   cat <<EOF
   Start a container named ${CONTAINER} from ${IMAGE}, in the background,
-  with port 8080 of the container published on port 8080 of the VM.
+  with port 8080 of the container published on port 8080 of the environment.
   Call it with curl on http://localhost:8080/ and on /healthz, then read its logs
   and match each line with the request that produced it.
   Details: chapter 1 page, Lab, task 3.
@@ -366,12 +359,12 @@ stage_3() {
 
   published="$(docker port "$CONTAINER" 8080/tcp 2>/dev/null || true)"
   if grep -q ':8080$' <<<"$published"; then
-    check_pass "Port 8080 of the container is published on port 8080 of the VM."
+    check_pass "Port 8080 of the container is published on port 8080 of the environment."
   elif [[ -n "$published" ]]; then
-    check_fail "Port 8080 of the container is published on $(head -n 1 <<<"$published"), the lab asks for port 8080 of the VM." "Remove the container and start it again with --publish 8080:8080."
+    check_fail "Port 8080 of the container is published on $(head -n 1 <<<"$published"), the lab asks for port 8080 of the environment." "Remove the container and start it again with --publish 8080:8080."
     return 0
   else
-    check_fail "Port 8080 of the container is not published on the VM." "EXPOSE does not publish. Remove the container and start it again with --publish 8080:8080."
+    check_fail "Port 8080 of the container is not published in the environment." "EXPOSE does not publish. Remove the container and start it again with --publish 8080:8080."
     return 0
   fi
 
@@ -396,58 +389,42 @@ stage_3() {
 
 stage_4_task() {
   cat <<EOF
-  Publish the image to your chapter registry:
-  sign Docker in with az acr login, tag the image with the login server of
-  the registry, then push it. course start 01 printed the login server.
-  This command prints it again:
-    az acr list --resource-group $(rg_name) --query "[].loginServer" --output tsv
+  Publish the image to the registry of the course, which runs on ${REGISTRY_HOST}:
+  tag the image with the name of the registry, then push it.
+  The registry lists what it holds with:
+    curl http://${REGISTRY_HOST}/v2/_catalog
   Details: chapter 1 page, Lab, task 4.
 EOF
 }
 
 stage_4() {
-  if ! az_signed_in; then
-    check_fail "The Azure CLI on the VM is not signed in, so the registry cannot be read." "Run course start 01 again, or: az login --identity"
-    return 0
-  fi
-
-  local registry_name registry_info login_server registry_sku admin_enabled tags remote_digest local_digests
-  registry_name="$(az acr list --resource-group "$(rg_name)" \
-    --query "[?tags.course=='${COURSE_TAG_VALUE}' && tags.chapter=='${CHAPTER}'].name | [0]" --output tsv 2>/dev/null || true)"
-  if [[ -z "$registry_name" ]]; then
-    check_fail "No registry tagged chapter=${CHAPTER} in $(rg_name)." "Run course start 01."
-    return 0
-  fi
-  registry_info="$(az acr show --name "$registry_name" --query "[loginServer, sku.name, adminUserEnabled]" --output tsv)"
-  read -r login_server registry_sku admin_enabled <<<"$(tr '\n' ' ' <<<"$registry_info")"
-  check_pass "Registry ${login_server} exists with the course tags (${registry_sku} tier)."
-  if [[ "$admin_enabled" == "false" ]]; then
-    check_pass "The registry admin account is disabled. Access goes through Microsoft Entra ID."
+  local registry_image="${REGISTRY_HOST}/${IMAGE}" local_id registry_tag_id remote_digest local_digests
+  if [[ "$(registry_state)" == "running" ]] && curl -fsS --max-time 5 "http://${REGISTRY_HOST}/v2/" >/dev/null 2>&1; then
+    check_pass "The registry of the course answers on ${REGISTRY_HOST}."
   else
-    check_warn "The registry admin account is enabled." "Disable it: a shared password cannot be traced to a person."
+    check_fail "The registry of the course does not answer on ${REGISTRY_HOST}." "Run course start 01, which starts it."
+    return 0
   fi
 
-  local local_id registry_tag_id
   local_id="$(docker image inspect --format '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
-  registry_tag_id="$(docker image inspect --format '{{.Id}}' "${login_server}/${IMAGE}" 2>/dev/null || true)"
+  registry_tag_id="$(docker image inspect --format '{{.Id}}' "$registry_image" 2>/dev/null || true)"
   if [[ -z "$registry_tag_id" ]]; then
-    check_fail "No local image is tagged ${login_server}/${IMAGE}." "Docker pushes to the registry named in the image name. Add that name with docker tag."
+    check_fail "No local image is tagged ${registry_image}." "Docker pushes to the registry named in the image name. Add that name with docker tag."
   elif [[ "$registry_tag_id" == "$local_id" ]]; then
-    check_pass "Your image also carries the registry name (${login_server}/${IMAGE})."
+    check_pass "Your image also carries the registry name (${registry_image})."
   else
-    check_fail "The tag ${login_server}/${IMAGE} points at an older build, not at your current ${IMAGE}." "A tag stays on the image it was given to. After a new build, run docker tag again, then push."
+    check_fail "The tag ${registry_image} points at an older build, not at your current ${IMAGE}." "A tag stays on the image it was given to. After a new build, run docker tag again, then push."
   fi
 
-  tags="$(az acr repository show-tags --name "$registry_name" --repository "$IMAGE_REPO" --output tsv 2>/dev/null || true)"
-  if ! grep -qx "$IMAGE_TAG" <<<"$tags"; then
-    check_fail "The repository ${IMAGE_REPO} has no tag ${IMAGE_TAG} in ${login_server}." "Run az acr login --name ${registry_name}, then push ${login_server}/${IMAGE}."
+  if ! registry_has_tag "$IMAGE_REPO" "$IMAGE_TAG"; then
+    check_fail "The registry has no tag ${IMAGE_TAG} for the repository ${IMAGE_REPO}." "Push it: docker push ${registry_image}"
     return 0
   fi
-  check_pass "The repository ${IMAGE_REPO} has the tag ${IMAGE_TAG}."
+  check_pass "The registry holds ${IMAGE_REPO}:${IMAGE_TAG}."
 
-  remote_digest="$(az acr repository show --name "$registry_name" --image "$IMAGE" --query digest --output tsv 2>/dev/null || true)"
+  remote_digest="$(registry_digest "$IMAGE_REPO" "$IMAGE_TAG")"
   local_digests="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null || true)"
-  if [[ -n "$remote_digest" ]] && grep -qx "${login_server}/${IMAGE_REPO}@${remote_digest}" <<<"$local_digests"; then
+  if [[ -n "$remote_digest" ]] && grep -qx "${REGISTRY_HOST}/${IMAGE_REPO}@${remote_digest}" <<<"$local_digests"; then
     check_pass "The pushed image has the same digest as your local image (${remote_digest:0:19}...)."
   else
     check_fail "The image in the registry is not your current local ${IMAGE}: the digests differ." "You built again after the push. Tag and push again, so that the registry holds what you tested."

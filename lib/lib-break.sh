@@ -17,6 +17,7 @@
 #   BREAK_CHECK              the course check command that confirms the repair
 #   restore_lab              puts the lab back as it was
 #   BREAK_NOTICE             one sentence that says what the script changes
+#   break_preflight          optional: stops the script when the lab cannot be broken, for example a cluster that is down
 # and ends with: run_break "$@"
 
 break_usage() {
@@ -161,7 +162,10 @@ run_break() {
     esac
     shift
   done
-  require_lab_vm
-  load_env
+  require_environment
+  require_lab_started "$CHAPTER" "$WORK_DIR"
+  if declare -F break_preflight >/dev/null; then
+    break_preflight
+  fi
   "break_${action}"
 }

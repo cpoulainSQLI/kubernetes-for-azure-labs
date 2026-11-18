@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Chapter 2 broken lab. Run it on the lab VM, once course check 02 passes:
+# Chapter 2 broken lab. Run it once course check 02 passes:
 #   course break 02
 # It changes one object in the sample-app namespace of your kind cluster.
 # You find the cause, check it with --diagnose, repair it, and course check 02 confirms.
-# It never touches your YAML files or Azure.
+# It never touches your YAML files or the registry.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,14 +18,19 @@ NS="sample-app"
 APP="sample-app"
 NODE_PORT=30080
 BREAK_CHECK="course check 02"
-BREAK_NOTICE="It changes one object in the ${NS} namespace of your kind cluster with a kubectl command. Your YAML files and Azure are not touched."
+BREAK_NOTICE="It changes one object in the ${NS} namespace of your kind cluster with a kubectl command. Your YAML files and the registry are not touched."
+
+# The faults change the cluster, so it has to run.
+break_preflight() {
+  require_lab_cluster "$CHAPTER"
+}
 
 SCENARIOS=(selector targetport replicas image)
 CAUSES=(
   "The selector of the Service no longer matches the labels of the pods."
   "The Service sends traffic to a port where the app does not listen."
   "The Deployment asks for 0 replicas."
-  "The Deployment asks for an image that is not on the nodes."
+  "The Deployment asks for an image that the registry does not hold."
   "A node of the cluster is not Ready."
   "The namespace ${NS} was deleted."
 )
@@ -80,10 +85,10 @@ explain_replicas() {
 
 symptom_image() { stuck_rollout; }
 inject_image() {
-  k set image "deployment/${APP}" "*=${APP}:3.0.0" >/dev/null
+  k set image "deployment/${APP}" "*=${REGISTRY_HOST}/${APP}:3.0.0" >/dev/null
 }
 explain_image() {
-  info "kubectl -n ${NS} get pods shows new pods in ErrImagePull or ImagePullBackOff, and kubectl -n ${NS} describe pod on one of them names the image ${APP}:3.0.0, which was never loaded into the nodes."
+  info "kubectl -n ${NS} get pods shows new pods in ErrImagePull or ImagePullBackOff, and kubectl -n ${NS} describe pod on one of them names the image ${REGISTRY_HOST}/${APP}:3.0.0, which the registry does not hold."
   info "The old pods keep serving, because a rollout waits for the new ones. kubectl -n ${NS} rollout undo deployment/${APP}, or kubectl apply -f on your files, goes back to the image that exists."
 }
 

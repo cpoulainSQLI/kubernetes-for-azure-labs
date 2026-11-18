@@ -1,10 +1,11 @@
 # Lab 02: a local Kubernetes cluster with one control plane node and two worker nodes.
-# kind runs each node as a Docker container on the lab VM.
+# kind runs each node as a Docker container in the environment of the course.
+# The nodes pull from the local registry: course start 02 connects them to it (lib/lib.sh).
 # The node image is pinned to the default image of kind v0.33.0 (Kubernetes v1.37.0),
 # with its digest, so every learner gets exactly the same cluster.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: aro-k8s
+name: kubernetes-labs
 nodes:
   - role: control-plane
     image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5

@@ -4,4 +4,4 @@ kind: Namespace
 metadata:
   name: sample-app
   labels:
-    app.kubernetes.io/part-of: aro-k8s-course
+    app.kubernetes.io/part-of: kubernetes-labs

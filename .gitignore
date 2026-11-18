@@ -1,4 +1,4 @@
-# Your settings stay on your own computer and on your lab VM.
+# Your settings stay on your own computer.
 .env
 
 # Editor and OS files
@@ -14,8 +14,8 @@ sample-app/sample-app.exe
 # Tools used by the checks
 __pycache__/
 
-# Terraform working files. The course command keeps them in ~/.aro-k8s, but the checks run terraform init here.
-# The state lives in Azure Storage, so a state file here would be a mistake: Git ignores it to keep it private.
+# Terraform working files of the frozen lab VM path in extras/. A state file here would be a mistake:
+# Git ignores it to keep it private.
 .terraform/
 *.tfstate
 *.tfstate.*

@@ -3,49 +3,42 @@
 # Source this file from a script. Do not run it on its own.
 # shellcheck disable=SC2034  # Variables defined here are used by the scripts that source this file.
 
-if [[ -n "${ARO_K8S_LIB_LOADED:-}" ]]; then
+if [[ -n "${KIT_LIB_LOADED:-}" ]]; then
   return 0
 fi
-ARO_K8S_LIB_LOADED=1
+KIT_LIB_LOADED=1
 
-COURSE_TAG_KEY="course"
-COURSE_TAG_VALUE="aro-k8s"
+# Every name of the environment derives from the name of the kit: the WSL distribution, the clone in it,
+# the kind cluster, its kubectl context, the registry and its volume. lib.ps1 uses the same names.
+KIT_NAME="kubernetes-labs"
+COURSE_NAME="Containers and Kubernetes"
 COURSE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAB_VM_MARKER="/etc/aro-k8s/lab-vm"
-KIND_CLUSTER_NAME="aro-k8s"
-VM_COURSE_DIR="aro-k8s-course"
 
-# Tool versions installed by cloud-init on the lab VM. Keep them in line with
-# setup/infra/cloud-init.yaml and labs/02-kubernetes-core/kind-cluster.yaml.
+# The course's own WSL distribution carries this marker. cloud-init writes it (setup/cloud-init.yaml).
+# A Linux machine of your own never gets it.
+ENV_MARKER="/etc/${KIT_NAME}/environment"
+TOOLS_READY="/etc/${KIT_NAME}/tools-ready"
+
+KIND_CLUSTER_NAME="$KIT_NAME"
+KUBE_CONTEXT="kind-${KIT_NAME}"
+REGISTRY_NAME="${KIT_NAME}-registry"
+REGISTRY_VOLUME="${KIT_NAME}-registry"
+# The registry port is fixed: manifests name localhost:5001, as the kind documentation does.
+REGISTRY_PORT="5001"
+REGISTRY_HOST="localhost:${REGISTRY_PORT}"
+REGISTRY_IMAGE="registry:3"
+# What the course command remembers between runs: which lab the cluster belongs to.
+STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/${KIT_NAME}"
+CLUSTER_LAB_FILE="${STATE_DIR}/cluster-lab"
+# The launcher that ./course up offers to put on the PATH of a Linux machine. Its second line names its kit.
+LAUNCHER_FILE="${HOME}/.local/bin/course"
+LAUNCHER_TAG="# course launcher of the kit"
+
+# Tool versions. setup/install-tools.sh installs them, and the readiness report checks them.
+# Keep them in line with setup/install-tools.sh, lib/lib.ps1 and labs/02-kubernetes-core/kind-cluster.yaml.
+# Docker Engine is not pinned: the readiness report prints its version.
 PINNED_KIND_VERSION="v0.33.0"
 PINNED_KUBECTL_MINOR="v1.37"
-
-# Terraform. The lab VM gets PINNED_TERRAFORM_VERSION from cloud-init. On your own computer, any
-# version from TERRAFORM_MIN_VERSION up works. Keep TERRAFORM_MIN_VERSION in line with the
-# required_version of every versions.tf file.
-TERRAFORM_MIN_VERSION="1.17.0"
-PINNED_TERRAFORM_VERSION="1.17.2"
-# Blob container that holds the Terraform state of the setup and of every lab, one blob each.
-STATE_CONTAINER="tfstate"
-# Name of the setup in the state container and in TF_DATA_DIR, and the chapter tag of its resources.
-SETUP_FOLDER="setup"
-SETUP_CHAPTER="00"
-
-# Git Bash on Windows rewrites arguments that start with a slash, such as
-# Azure resource IDs. This turns that rewriting off for every az call.
-# The Azure CLI for Windows also ends its output lines with a carriage return,
-# which breaks string comparisons in bash, so the wrapper below removes it.
-case "$(uname -s)" in
-  MINGW* | MSYS* | CYGWIN*)
-    export MSYS_NO_PATHCONV=1
-    az() {
-      local rc
-      command az "$@" | tr -d '\r'
-      rc="${PIPESTATUS[0]}"
-      return "$rc"
-    }
-    ;;
-esac
 
 if [[ -t 1 ]]; then
   C_GREEN=$'\033[32m'
@@ -173,312 +166,62 @@ confirm() {
 }
 
 # ---------------------------------------------------------------------------
-# Settings from .env
-# ---------------------------------------------------------------------------
-
-# Reads KEY=VALUE lines from .env without executing them.
-load_env() {
-  local env_file="${COURSE_ROOT}/.env"
-  if [[ ! -f "$env_file" ]]; then
-    if on_lab_vm; then
-      die "No .env file at ${env_file}. On your own computer, run: ./course up (.\\course.ps1 up in PowerShell). It copies .env to the lab VM."
-    fi
-    die "No .env file at ${env_file}. Copy .env.example to .env and fill it in."
-  fi
-  local line key value
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%$'\r'}"
-    if [[ ! "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
-      continue
-    fi
-    key="${BASH_REMATCH[1]}"
-    value="${BASH_REMATCH[2]}"
-    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then
-      value="${BASH_REMATCH[1]}"
-    fi
-    export "${key}=${value}"
-  done <"$env_file"
-
-  export PREFIX="${PREFIX:-arok8s}"
-  export REGION="${REGION:-swedencentral}"
-  export CURRENCY="${CURRENCY:-EUR}"
-  export BUDGET_AMOUNT="${BUDGET_AMOUNT:-30}"
-  export BUDGET_CONTACT_EMAIL="${BUDGET_CONTACT_EMAIL:-}"
-  export AZURE_SUBSCRIPTION="${AZURE_SUBSCRIPTION:-}"
-  export LEARNER_IP="${LEARNER_IP:-}"
-  export SSH_KEY_PATH="${SSH_KEY_PATH:-~/.ssh/aro-k8s-lab}"
-  export ADMIN_USERNAME="${ADMIN_USERNAME:-azureuser}"
-  export VM_SIZE="${VM_SIZE:-Standard_D2as_v5}"
-  export VM_IMAGE="${VM_IMAGE:-Canonical:ubuntu-26_04-lts:server:latest}"
-  export OS_DISK_GB="${OS_DISK_GB:-64}"
-  export AUTO_SHUTDOWN_TIME="${AUTO_SHUTDOWN_TIME:-1900}"
-  export AUTO_SHUTDOWN_TIMEZONE="${AUTO_SHUTDOWN_TIMEZONE:-UTC}"
-  export KIT_REPO="${KIT_REPO:-}"
-
-  if [[ ! "$PREFIX" =~ ^[a-z][a-z0-9]{2,11}$ ]]; then
-    die "PREFIX must be 3 to 12 lowercase letters or digits and start with a letter."
-  fi
-  if [[ ! "$BUDGET_AMOUNT" =~ ^[0-9]+$ ]]; then
-    die "BUDGET_AMOUNT must be a whole number, for example 30."
-  fi
-  case "$OS_DISK_GB" in
-    32 | 64 | 128) ;;
-    *) die "OS_DISK_GB must be 32, 64 or 128." ;;
-  esac
-  if [[ ! "$AUTO_SHUTDOWN_TIME" =~ ^[0-2][0-9][0-5][0-9]$ ]]; then
-    die "AUTO_SHUTDOWN_TIME must use the hhmm format, for example 1900."
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Names and tags
-# ---------------------------------------------------------------------------
-
-rg_name() { printf '%s-lab-rg' "$PREFIX"; }
-vm_name() { printf '%s-lab-vm' "$PREFIX"; }
-budget_name() { printf '%s-monthly-budget' "$PREFIX"; }
-state_rg_name() { printf '%s-tfstate-rg' "$PREFIX"; }
-
-# Prints the name of the storage account that holds the Terraform state, from the subscription ID.
-# Account names are unique across Azure, so the name ends with 8 characters of a SHA-256 hash of
-# the subscription ID. Every computer and the lab VM work out the same name. lib.ps1 does the same.
-state_account_name() {
-  local hash
-  if command -v sha256sum >/dev/null 2>&1; then
-    hash="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sha256sum | cut -c1-8)"
-  else
-    hash="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | shasum -a 256 | cut -c1-8)"
-  fi
-  printf '%stf%s' "$PREFIX" "$hash"
-}
-
-# Prints the tag arguments for az commands, for example: course=aro-k8s chapter=01
-course_tags() {
-  printf '%s=%s chapter=%s' "$COURSE_TAG_KEY" "$COURSE_TAG_VALUE" "$1"
-}
-
-# Prints the Standard SSD disk tier that matches OS_DISK_GB.
-os_disk_tier() {
-  case "$OS_DISK_GB" in
-    32) printf 'E4' ;;
-    64) printf 'E6' ;;
-    128) printf 'E10' ;;
-  esac
-}
-
-# ---------------------------------------------------------------------------
 # Where the script runs
 # ---------------------------------------------------------------------------
 
-on_lab_vm() {
-  [[ -f "$LAB_VM_MARKER" ]]
+# Prints linux, macos or windows. Windows means Git Bash or a similar shell, where the labs do not run.
+host_platform() {
+  case "$(uname -s)" in
+    Linux*) printf 'linux' ;;
+    Darwin*) printf 'macos' ;;
+    MINGW* | MSYS* | CYGWIN*) printf 'windows' ;;
+    *) printf 'other' ;;
+  esac
 }
 
-require_lab_vm() {
-  if ! on_lab_vm; then
-    die "Run this on the lab VM, not on your own computer. Connect with: ./course connect (.\\course.ps1 connect in PowerShell)"
-  fi
-}
-
-require_laptop() {
-  if on_lab_vm; then
-    die "Run this on your own computer, not on the lab VM."
-  fi
-}
-
-# Converts a path for Windows programs such as az when running in Git Bash.
-native_path() {
-  if command -v cygpath >/dev/null 2>&1; then
-    cygpath -m "$1"
-  else
-    printf '%s' "$1"
-  fi
+# Returns 0 inside the course's own WSL distribution.
+in_course_wsl() {
+  [[ -f "$ENV_MARKER" ]]
 }
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    die "The command '$1' is missing. ${2:-}"
+    die "The command '$1' is missing. ${2:-Run the readiness report: course check}"
   fi
 }
 
-# ---------------------------------------------------------------------------
-# Azure CLI
-# ---------------------------------------------------------------------------
-
-az_signed_in() {
-  az account show --output none 2>/dev/null
+# Stops unless the script runs where the labs run: the course's WSL distribution, a Linux machine, or a Mac.
+require_environment() {
+  if [[ "$(host_platform)" == "windows" ]]; then
+    die "On Windows, the labs run in the WSL distribution of the course. Open it with: .\\course.ps1 connect (in PowerShell, from the kit folder), then run the course command there."
+  fi
 }
 
-require_az_login() {
-  if az_signed_in; then
+# Stops with one message when Docker does not answer.
+require_docker() {
+  require_cmd docker "Run: ./course up, from the kit folder"
+  if docker info >/dev/null 2>&1; then
     return 0
   fi
-  if on_lab_vm; then
-    die "The Azure CLI on the lab VM is not signed in. Run: az login --identity"
+  if [[ "$(host_platform)" == "linux" ]] && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    die "Docker does not answer, and your user is not in the docker group yet. Close this terminal, open a new one, and run the command again."
   fi
-  die "The Azure CLI is not signed in. Run: az login"
+  die "Docker Engine does not answer. Start it, then run the command again. On Linux: sudo systemctl start docker"
 }
 
-# Setup scripts on the lab VM sign in with the VM's managed identity.
-ensure_vm_identity_login() {
-  if az_signed_in; then
-    return 0
-  fi
-  info "Signing in to Azure with the lab VM's managed identity."
-  az login --identity --output none
-}
-
-# Stops when AZURE_SUBSCRIPTION is set and the CLI points at another subscription.
-require_expected_subscription() {
-  if [[ -z "$AZURE_SUBSCRIPTION" ]]; then
-    return 0
-  fi
-  local current_name current_id
-  current_name="$(az account show --query name --output tsv)"
-  current_id="$(az account show --query id --output tsv)"
-  if [[ "$AZURE_SUBSCRIPTION" != "$current_name" && "$AZURE_SUBSCRIPTION" != "$current_id" ]]; then
-    die "The Azure CLI points at '${current_name}', not at AZURE_SUBSCRIPTION. Run: az account set --subscription \"\$AZURE_SUBSCRIPTION\""
-  fi
-}
-
-# ---------------------------------------------------------------------------
-# Prices from the Azure Retail Prices API (no sign-in needed)
-# ---------------------------------------------------------------------------
-
-# retail_price FILTER [JMESPATH]
-# Prints the first matching pay-as-you-go Linux price, or n/a when the lookup fails.
-retail_price() {
-  local filter="$1"
-  local query="${2:-Items[?type=='Consumption' && !contains(productName, 'Windows') && !contains(skuName, 'Spot') && !contains(skuName, 'Low Priority')].retailPrice | [0]}"
-  local price=""
-  price="$(az rest --method get --skip-authorization-header \
-    --url "https://prices.azure.com/api/retail/prices" \
-    --url-parameters "currencyCode='${CURRENCY}'" "\$filter=${filter}" \
-    --query "$query" --output tsv 2>/dev/null || true)"
-  if [[ -z "$price" || "$price" == "None" ]]; then
-    printf 'n/a'
-  else
-    printf '%s' "$price"
-  fi
-}
-
-price_vm_hour() {
-  retail_price "serviceName eq 'Virtual Machines' and armRegionName eq '${REGION}' and armSkuName eq '${VM_SIZE}'"
-}
-
-price_disk_month() {
-  local tier
-  tier="$(os_disk_tier)"
-  retail_price "armRegionName eq '${REGION}' and productName eq 'Standard SSD Managed Disks' and meterName eq '${tier} LRS Disk'" \
-    "Items[?type=='Consumption'].retailPrice | [0]"
-}
-
-price_public_ip_hour() {
-  retail_price "armRegionName eq '${REGION}' and productName eq 'IP Addresses' and meterName eq 'Standard IPv4 Static Public IP'" \
-    "Items[?type=='Consumption'].retailPrice | [0]"
-}
-
-price_blob_gb_month() {
-  retail_price "armRegionName eq '${REGION}' and productName eq 'General Block Blob v2' and meterName eq 'Hot LRS Data Stored'" \
-    "Items[?type=='Consumption' && tierMinimumUnits==\`0\`].retailPrice | [0]"
-}
-
-price_acr_basic_day() {
-  retail_price "armRegionName eq '${REGION}' and serviceName eq 'Container Registry' and meterName eq 'Basic Registry Unit'" \
-    "Items[?type=='Consumption'].retailPrice | [0]"
-}
-
-# ---------------------------------------------------------------------------
-# Terraform
-# ---------------------------------------------------------------------------
-
-# Prints the version of the installed terraform, for example 1.17.2, or nothing.
-terraform_version() {
-  terraform version 2>/dev/null | sed -n '1s/^Terraform v\([0-9][0-9.]*\).*/\1/p'
-}
-
-# version_at_least HAVE NEED returns 0 when version HAVE is NEED or later. Works with bash 3.2.
-version_at_least() {
-  local IFS=. i
-  local -a have need
-  read -r -a have <<<"$1"
-  read -r -a need <<<"$2"
-  for i in 0 1 2; do
-    if ((${have[i]:-0} > ${need[i]:-0})); then
-      return 0
+# Reads optional KEY=VALUE lines from .env without executing them. The course runs without .env.
+load_env() {
+  local env_file="${COURSE_ROOT}/.env" line
+  [[ -f "$env_file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    if [[ "$line" =~ ^([A-Z][A-Z0-9_]*)=(.*)$ ]]; then
+      export "${BASH_REMATCH[1]}=${BASH_REMATCH[2]}"
     fi
-    if ((${have[i]:-0} < ${need[i]:-0})); then
-      return 1
-    fi
-  done
-  return 0
+  done <"$env_file"
 }
 
-require_terraform() {
-  require_cmd terraform "Install Terraform ${TERRAFORM_MIN_VERSION} or later: https://developer.hashicorp.com/terraform/install"
-  local version
-  version="$(terraform_version)"
-  if ! version_at_least "$version" "$TERRAFORM_MIN_VERSION"; then
-    die "Terraform ${version:-of unknown version} is installed. The course needs ${TERRAFORM_MIN_VERSION} or later."
-  fi
-}
-
-# terraform_env FOLDER SUBSCRIPTION_ID prepares a Terraform run for the setup or for one lab.
-# Terraform keeps its working files (the provider, the plan) in ~/.aro-k8s/terraform/FOLDER,
-# outside the kit folder, so they never end up in a commit.
-terraform_env() {
-  local dir="${HOME}/.aro-k8s/terraform/$1"
-  mkdir -p "$dir"
-  TF_DATA_DIR="$(native_path "$dir")"
-  ARM_SUBSCRIPTION_ID="$2"
-  export TF_DATA_DIR ARM_SUBSCRIPTION_ID TF_IN_AUTOMATION=1 TF_INPUT=0
-}
-
-# export_setup_tf_vars STATE_ACCOUNT ALERT_EMAIL SSH_PUBLIC_KEY KIT_URL passes the settings of .env to
-# the configuration in setup/infra as TF_VAR_ environment variables. course up and course destroy both need them.
-export_setup_tf_vars() {
-  local start_date state_rg
-  start_date="$(date -u +%Y-%m-01)"
-  state_rg="$(state_rg_name)"
-  export TF_VAR_prefix="$PREFIX" TF_VAR_location="$REGION" TF_VAR_chapter="$SETUP_CHAPTER"
-  export TF_VAR_budget_amount="$BUDGET_AMOUNT" TF_VAR_budget_start_date="$start_date"
-  export TF_VAR_alert_email="$2" TF_VAR_learner_ip="$LEARNER_IP" TF_VAR_ssh_public_key="$3"
-  export TF_VAR_admin_username="$ADMIN_USERNAME" TF_VAR_vm_size="$VM_SIZE" TF_VAR_vm_image="$VM_IMAGE"
-  export TF_VAR_os_disk_size_gb="$OS_DISK_GB" TF_VAR_auto_shutdown_time="$AUTO_SHUTDOWN_TIME"
-  export TF_VAR_auto_shutdown_timezone="$AUTO_SHUTDOWN_TIMEZONE"
-  export TF_VAR_state_resource_group_name="$state_rg" TF_VAR_state_storage_account_name="$1"
-  export TF_VAR_kit_repo_url="$4"
-}
-
-# terraform_in DIR ARGS... runs terraform on the configuration in folder DIR.
-terraform_in() {
-  local dir="$1"
-  shift
-  terraform -chdir="$(native_path "$dir")" "$@"
-}
-
-# terraform_init DIR ACCOUNT KEY connects the configuration in DIR to its state: the blob KEY in the
-# state container of storage account ACCOUNT, reached with Microsoft Entra ID. On your own computer
-# Terraform signs in through the Azure CLI, on the lab VM with the VM's managed identity.
-terraform_init() {
-  local dir="$1" account="$2" key="$3" auth="use_cli=true"
-  if on_lab_vm; then
-    auth="use_msi=true"
-  fi
-  terraform_in "$dir" init -reconfigure \
-    -backend-config="storage_account_name=${account}" \
-    -backend-config="container_name=${STATE_CONTAINER}" \
-    -backend-config="key=${key}" \
-    -backend-config="use_azuread_auth=true" \
-    -backend-config="$auth"
-}
-
-# ---------------------------------------------------------------------------
-# Lab VM access from your own computer
-# ---------------------------------------------------------------------------
-
-# Returns 0 when a TCP port answers within 5 seconds. Works with bash 3.2 (macOS),
-# which has no timeout command.
+# Returns 0 when a TCP port answers within 5 seconds. Works with bash 3.2 (macOS), which has no timeout command.
 tcp_port_open() {
   local host="$1" port="$2" probe watchdog
   (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null &
@@ -493,129 +236,273 @@ tcp_port_open() {
   return 1
 }
 
-ssh_key_file() {
-  printf '%s' "${SSH_KEY_PATH/#\~/$HOME}"
+# version_at_least HAVE NEED returns 0 when version HAVE is NEED or later. Works with bash 3.2.
+version_at_least() {
+  local IFS=. i
+  local -a have need
+  read -r -a have <<<"${1#v}"
+  read -r -a need <<<"${2#v}"
+  for i in 0 1 2; do
+    if ((${have[i]:-0} > ${need[i]:-0})); then
+      return 0
+    fi
+    if ((${have[i]:-0} < ${need[i]:-0})); then
+      return 1
+    fi
+  done
+  return 0
 }
 
-known_hosts_file() {
-  printf '%s/.ssh/aro-k8s_known_hosts' "$HOME"
+# Prints the installed versions, for example v0.33.0 and v1.37.2, or nothing when the tool is missing.
+kind_version() {
+  kind version 2>/dev/null | sed -n 's/^kind \(v[0-9][0-9.]*\).*/\1/p'
 }
-
-vm_public_ip() {
-  az network public-ip show --resource-group "$(rg_name)" --name "$(vm_name)-pip" \
-    --query ipAddress --output tsv 2>/dev/null || true
+kubectl_version() {
+  kubectl version --client 2>/dev/null | sed -n 's/^Client Version: \(v[0-9][0-9.]*\).*/\1/p'
 }
-
-# Runs a command on the lab VM over SSH. With no arguments it opens a shell.
-# No BatchMode: if the key has a passphrase and no SSH agent holds it, ssh asks for it, as in lib.ps1.
-lab_ssh() {
-  local ip
-  ip="$(vm_public_ip)"
-  if [[ -z "$ip" ]]; then
-    die "No public IP found for the lab VM. Create it first with: ./course up"
-  fi
-  ssh -i "$(ssh_key_file)" \
-    -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="$(known_hosts_file)" \
-    -o ConnectTimeout=10 \
-    "${ADMIN_USERNAME}@${ip}" "$@"
-}
-
-# Copies a file from your computer to the lab VM, for example: lab_scp .env aro-k8s-course/.env
-lab_scp() {
-  local ip
-  ip="$(vm_public_ip)"
-  if [[ -z "$ip" ]]; then
-    die "No public IP found for the lab VM. Create it first with: ./course up"
-  fi
-  scp -q -i "$(ssh_key_file)" \
-    -o StrictHostKeyChecking=accept-new \
-    -o UserKnownHostsFile="$(known_hosts_file)" \
-    -o ConnectTimeout=10 \
-    "$1" "${ADMIN_USERNAME}@${ip}:$2"
-}
-
-# lab_run_script FILE ARG runs a bash script of the kit on the lab VM with one argument. The script travels
-# base64-encoded on the SSH command line, so no line ending or quote can change it on the way.
-# The argument must not contain a single quote.
-lab_run_script() {
-  local encoded
-  encoded="$(base64 <"$1" | tr -d '\r\n')"
-  lab_ssh "printf '%s' '${encoded}' | base64 -d | bash -s -- '$2'"
+docker_version() {
+  docker version --format '{{.Server.Version}}' 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
-# The kit on the lab VM
+# The local registry, part of the environment
 # ---------------------------------------------------------------------------
 
-# Prints the HTTPS URL that the lab VM clones the kit from: KIT_REPO from .env, or else the origin of this
-# clone (git remote get-url origin) converted to HTTPS. Prints nothing when it finds no usable URL.
-# git@host:owner/repo.git and ssh://git@host/owner/repo.git become https://host/owner/repo.git, and a user
-# name or token in an HTTPS URL is dropped, so that no credential reaches the lab VM. lib.ps1 does the same.
-kit_repo_url() {
-  local url="${KIT_REPO:-}" rest host path
-  if [[ -z "$url" ]]; then
-    url="$(git -C "$COURSE_ROOT" remote get-url origin 2>/dev/null || true)"
-  fi
-  url="${url%$'\r'}"
-  case "$url" in
-    git@*:*)
-      rest="${url#git@}"
-      host="${rest%%:*}"
-      path="${rest#*:}"
-      ;;
-    ssh://*)
-      rest="${url#ssh://}"
-      host="${rest%%/*}"
-      path="${rest#*/}"
-      host="${host##*@}"
-      host="${host%%:*}"
-      ;;
-    https://*)
-      rest="${url#https://}"
-      host="${rest%%/*}"
-      path="${rest#*/}"
-      host="${host##*@}"
-      ;;
-    *) return 0 ;;
-  esac
-  url="https://${host}/${path#/}"
-  if [[ "$url" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?/[A-Za-z0-9._~/-]+$ ]]; then
-    printf '%s' "$url"
-  fi
+# Prints the state of the registry container: running, exited, created, or nothing when it does not exist.
+registry_state() {
+  docker container inspect --format '{{.State.Status}}' "$REGISTRY_NAME" 2>/dev/null || true
 }
 
-# install_kit_on_vm URL makes sure that the kit is cloned in ~/aro-k8s-course on the lab VM and that the
-# course command is on its PATH (setup/kit-on-vm.sh), then copies .env, and only .env, next to it.
-# It never pulls: course update does that.
-install_kit_on_vm() {
-  if ! lab_run_script "${COURSE_ROOT}/setup/kit-on-vm.sh" "$1"; then
-    die "Could not clone the kit on the lab VM from $1. A fork must be public, or set KIT_REPO in .env."
-  fi
-  lab_scp "${COURSE_ROOT}/.env" "${VM_COURSE_DIR}/.env"
-  lab_ssh "chmod 600 ~/${VM_COURSE_DIR}/.env"
-  info "Copied .env to ~/${VM_COURSE_DIR} on the lab VM."
-}
-
-# ---------------------------------------------------------------------------
-# Clean-up report
-# ---------------------------------------------------------------------------
-
-list_course_resources() {
-  step "Azure resources still tagged ${COURSE_TAG_KEY}=${COURSE_TAG_VALUE}"
-  local groups resources
-  groups="$(az group list --tag "${COURSE_TAG_KEY}=${COURSE_TAG_VALUE}" \
-    --query "[].{group:name, chapter:tags.chapter, state:properties.provisioningState}" --output table 2>/dev/null || true)"
-  resources="$(az resource list --tag "${COURSE_TAG_KEY}=${COURSE_TAG_VALUE}" \
-    --query "[].{name:name, type:type, chapter:tags.chapter, group:resourceGroup}" --output table 2>/dev/null || true)"
-  if [[ -z "$groups" && -z "$resources" ]]; then
-    info "Nothing found. No course resource is left in this subscription."
+# Creates the registry with a named volume for its data, or starts it when it is stopped. Safe to run twice.
+# course clean NN never removes it. course destroy removes it with its volume.
+ensure_registry() {
+  local state
+  state="$(registry_state)"
+  if [[ "$state" == "running" ]]; then
+    info "The registry ${REGISTRY_NAME} runs on ${REGISTRY_HOST}."
     return 0
   fi
-  if [[ -n "$groups" ]]; then
-    printf 'Resource groups:\n%s\n\n' "$groups"
+  if tcp_port_open 127.0.0.1 "$REGISTRY_PORT"; then
+    die "Something else listens on port ${REGISTRY_PORT}, which the registry of the course needs. Stop that program, then run the command again. On Linux, this shows it: sudo ss -ltnp 'sport = :${REGISTRY_PORT}'"
   fi
-  if [[ -n "$resources" ]]; then
-    printf 'Resources:\n%s\n' "$resources"
+  if [[ -n "$state" ]]; then
+    info "Starting the registry ${REGISTRY_NAME}, which was ${state}."
+    docker start "$REGISTRY_NAME" >/dev/null
+  else
+    info "Creating the registry ${REGISTRY_NAME} on ${REGISTRY_HOST}, with its data in the Docker volume ${REGISTRY_VOLUME}."
+    docker volume create "$REGISTRY_VOLUME" >/dev/null
+    docker pull --quiet "$REGISTRY_IMAGE" >/dev/null
+    docker run --detach --restart=always --publish "127.0.0.1:${REGISTRY_PORT}:5000" --network bridge \
+      --name "$REGISTRY_NAME" --volume "${REGISTRY_VOLUME}:/var/lib/registry" "$REGISTRY_IMAGE" >/dev/null
+  fi
+  local _
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -fsS --max-time 2 "http://${REGISTRY_HOST}/v2/" >/dev/null 2>&1; then
+      info "The registry answers on ${REGISTRY_HOST}."
+      return 0
+    fi
+    sleep 1
+  done
+  die "The registry ${REGISTRY_NAME} does not answer on ${REGISTRY_HOST}. Read its log: docker logs ${REGISTRY_NAME}"
+}
+
+# Stops with one message when the registry is not running. Lab scripts call it, course up creates the registry.
+require_registry() {
+  local state
+  state="$(registry_state)"
+  if [[ -z "$state" ]]; then
+    die "The registry of the course does not exist. Create it from the kit folder with: ./course up"
+  fi
+  if [[ "$state" != "running" ]]; then
+    ensure_registry
+  fi
+}
+
+# registry_has_tag REPOSITORY TAG returns 0 when the registry holds that tag.
+registry_has_tag() {
+  curl -fsS --max-time 5 "http://${REGISTRY_HOST}/v2/$1/tags/list" 2>/dev/null |
+    jq -e --arg tag "$2" '(.tags // []) | index($tag) != null' >/dev/null 2>&1
+}
+
+# registry_digest REPOSITORY TAG prints the digest of the manifest the registry serves for that tag.
+registry_digest() {
+  curl -fsS --max-time 5 --head \
+    -H 'Accept: application/vnd.oci.image.index.v1+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+    -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+    -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+    "http://${REGISTRY_HOST}/v2/$1/manifests/$2" 2>/dev/null |
+    tr -d '\r' | sed -n 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: *//p'
+}
+
+# ---------------------------------------------------------------------------
+# The kind cluster: one at a time, owned by one lab
+# ---------------------------------------------------------------------------
+
+cluster_exists() {
+  kind get clusters 2>/dev/null | grep -qx "$KIND_CLUSTER_NAME"
+}
+
+# Prints the lab number that the cluster belongs to, for example 02, or nothing when no lab recorded it.
+cluster_lab() {
+  if cluster_exists && [[ -f "$CLUSTER_LAB_FILE" ]]; then
+    tr -d '[:space:]' <"$CLUSTER_LAB_FILE"
+  fi
+}
+
+record_cluster_lab() {
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$1" >"$CLUSTER_LAB_FILE"
+}
+
+forget_cluster_lab() {
+  rm -f "$CLUSTER_LAB_FILE"
+}
+
+# Prints the node containers of the cluster with their state, one per line: "name state".
+cluster_nodes_state() {
+  local node
+  for node in $(kind get nodes --name "$KIND_CLUSTER_NAME" 2>/dev/null); do
+    printf '%s %s\n' "$node" "$(docker container inspect --format '{{.State.Status}}' "$node" 2>/dev/null || echo missing)"
+  done
+}
+
+# Starts the node containers that are stopped. WSL stops the distribution when its last terminal closes,
+# and the control plane does not always come back at the next start: one docker start repairs it.
+start_stopped_nodes() {
+  local node state started=""
+  while read -r node state; do
+    [[ -n "$node" ]] || continue
+    if [[ "$state" != "running" ]]; then
+      docker start "$node" >/dev/null
+      started="${started} ${node}"
+    fi
+  done <<<"$(cluster_nodes_state)"
+  if [[ -n "$started" ]]; then
+    info "Started the node containers that were stopped:${started}."
+  else
+    info "Every node container runs."
+  fi
+}
+
+# Waits until the API server answers and every node is Ready. Returns 1 after about 3 minutes.
+wait_for_nodes() {
+  local deadline=$((SECONDS + 120))
+  until kubectl --context "$KUBE_CONTEXT" get nodes >/dev/null 2>&1; do
+    if ((SECONDS >= deadline)); then
+      return 1
+    fi
+    sleep 2
+  done
+  kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready nodes --all --timeout=120s >/dev/null
+}
+
+# Lets the nodes pull from the local registry, as the kind documentation describes: a hosts.toml file on each
+# node maps localhost:5001 to the registry container, the registry joins the kind network, and a ConfigMap
+# documents it. https://kind.sigs.k8s.io/docs/user/local-registry/
+connect_registry_to_cluster() {
+  local node dir="/etc/containerd/certs.d/${REGISTRY_HOST}"
+  for node in $(kind get nodes --name "$KIND_CLUSTER_NAME"); do
+    docker exec "$node" mkdir -p "$dir"
+    printf '[host."http://%s:5000"]\n' "$REGISTRY_NAME" | docker exec -i "$node" cp /dev/stdin "${dir}/hosts.toml"
+  done
+  if [[ "$(docker inspect --format '{{json .NetworkSettings.Networks.kind}}' "$REGISTRY_NAME")" == "null" ]]; then
+    docker network connect kind "$REGISTRY_NAME"
+  fi
+  kubectl --context "$KUBE_CONTEXT" apply -f - >/dev/null <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: local-registry-hosting
+  namespace: kube-public
+data:
+  localRegistryHosting.v1: |
+    host: "${REGISTRY_HOST}"
+    help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
+EOF
+}
+
+# Prints the folder of a lab from its number, for example labs/02-kubernetes-core for 02, or nothing.
+lab_folder() {
+  local dir
+  for dir in "${COURSE_ROOT}"/labs/"$1"-*/; do
+    if [[ -d "$dir" ]]; then
+      printf '%s' "${dir%/}"
+      return 0
+    fi
+  done
+}
+
+# lab_cluster_up NN CONFIG makes sure the cluster of lab NN runs: it creates it when it is missing, starts the
+# node containers that are stopped, and waits for every node to be Ready. One cluster runs at a time: when the
+# cluster of another lab exists, it asks to clean that lab first.
+lab_cluster_up() {
+  local lab="$1" config="$2" owner other
+  owner="$(cluster_lab)"
+  if cluster_exists && [[ "$owner" != "$lab" ]]; then
+    if [[ -n "$owner" ]]; then
+      other="$(lab_folder "$owner")"
+      info "The cluster of lab ${owner} still exists. One cluster runs at a time."
+      if ! confirm "Clean lab ${owner} first (course clean ${owner}), then set up lab ${lab}?"; then
+        info "Nothing changed. Lab ${owner} keeps its cluster."
+        exit 0
+      fi
+      if [[ -n "$other" && -f "${other}/teardown.sh" ]]; then
+        ASSUME_YES=1 bash "${other}/teardown.sh" --yes
+      else
+        kind delete cluster --name "$KIND_CLUSTER_NAME"
+        forget_cluster_lab
+      fi
+    else
+      info "A kind cluster named ${KIND_CLUSTER_NAME} exists, and no lab of this kit recorded it."
+      if ! confirm "Delete it and create the cluster of lab ${lab}?"; then
+        info "Nothing changed."
+        exit 0
+      fi
+      kind delete cluster --name "$KIND_CLUSTER_NAME"
+    fi
+  fi
+
+  if cluster_exists; then
+    step "The cluster of lab ${lab}"
+    start_stopped_nodes
+  else
+    step "Creating the cluster of lab ${lab} (about a minute, more the first time)"
+    kind create cluster --config "$config" --wait 180s
+    record_cluster_lab "$lab"
+  fi
+  kubectl config use-context "$KUBE_CONTEXT" >/dev/null
+  info "Waiting for the nodes to be Ready."
+  if ! wait_for_nodes; then
+    die "The nodes are not Ready after 4 minutes. Look at them with: docker ps --all, and kubectl get nodes. If the cluster does not come back, course clean ${lab} then course start ${lab} creates it again. Your files in ~/work are kept, and what you applied to the cluster is lost."
+  fi
+  connect_registry_to_cluster
+  kubectl --context "$KUBE_CONTEXT" get nodes
+  # After a stop, the pods of the lab start again with the nodes. Wait for them, so that what course start says
+  # about the next task is true. A fault of course break can keep a pod from ever being ready: the wait ends.
+  info "Waiting for the pods to be ready (at most a minute)."
+  if ! kubectl --context "$KUBE_CONTEXT" wait --for=condition=Ready pods --all --all-namespaces --field-selector=status.phase!=Succeeded,status.phase!=Failed --timeout=60s >/dev/null 2>&1; then
+    info "Some pods are not ready after a minute. This shows them: kubectl get pods --all-namespaces"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Lab state, for course check and course break
+# ---------------------------------------------------------------------------
+
+# Stops with one message when lab NN was never started: its work folder does not exist.
+require_lab_started() {
+  if [[ ! -d "$2" ]]; then
+    die "Lab $1 is not started. Run: course start $1"
+  fi
+}
+
+# Stops with one message when the cluster of lab NN does not answer, for example after the environment stopped.
+require_lab_cluster() {
+  if ! cluster_exists || [[ "$(cluster_lab)" != "$1" ]]; then
+    die "The cluster of lab $1 does not exist. Run: course start $1"
+  fi
+  if ! kubectl --context "$KUBE_CONTEXT" get nodes >/dev/null 2>&1; then
+    die "The cluster of lab $1 is not running. Run: course start $1"
   fi
 }

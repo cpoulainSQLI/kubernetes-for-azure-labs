@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Staged validation for the labs that run on the lab VM (chapter 1 onwards).
+# Staged validation of the labs (chapter 1 onwards).
 # Source this file after lib.sh. Do not run it on its own.
 # shellcheck disable=SC2034  # Variables defined here are used by the validators that source this file.
 #
@@ -11,6 +11,7 @@
 #   stage_N_task    prints what the learner does in stage N (guided mode)
 #   stage_N_enter   optional: runs once in guided mode, just before stage N is first checked.
 #                   A stage can use it to note the state it starts from.
+#   WORK_DIR        the folder of the learner's work, which course start creates
 #   DEEP_NOTICE     one sentence that says what the live tests of this chapter do
 #   preflight       optional: runs first and stops the script when the lab cannot be checked at all
 # and ends with: run_validation "$@"
@@ -29,13 +30,14 @@ STAGE_SKIP=0
 
 validation_usage() {
   cat <<EOF
-Usage: course check ${CHAPTER} [--guided] [--stage N] [--deep]
+Usage: course check ${CHAPTER} [--guided] [--stage N] [--deep] [--next]
 
   (no option)  Full report: PASS, FAIL or WARN for every check of the lab. Read-only.
   --guided     One stage at a time, in the order of the lab tasks: shows the task,
                checks it, gives hints and lets you try again. Read-only.
   --stage N    Report for stage N only (1 to ${#STAGE_TITLES[@]}).
   --deep       Adds the live tests: ${DEEP_NOTICE}
+  --next       Prints one line: the first task that does not pass yet. Read-only.
   -h, --help   Shows this text.
 
 Exit code 0 when no check fails, 1 otherwise.
@@ -46,6 +48,7 @@ parse_validation_args() {
   while (($# > 0)); do
     case "$1" in
       --guided) VALIDATE_MODE="guided" ;;
+      --next) VALIDATE_MODE="next" ;;
       --deep) VALIDATE_DEEP=1 ;;
       --stage)
         shift
@@ -64,8 +67,8 @@ parse_validation_args() {
     if [[ ! "$VALIDATE_STAGE" =~ ^[0-9]+$ ]] || ((VALIDATE_STAGE < 1 || VALIDATE_STAGE > ${#STAGE_TITLES[@]})); then
       die "--stage takes a number from 1 to ${#STAGE_TITLES[@]}."
     fi
-    if [[ "$VALIDATE_MODE" == "guided" ]]; then
-      die "Use --guided or --stage, not both."
+    if [[ "$VALIDATE_MODE" != "report" ]]; then
+      die "Use --stage alone, without --guided or --next."
     fi
   fi
 }
@@ -280,9 +283,35 @@ run_guided() {
   validation_summary "$unchecked"
 }
 
+# Prints where the learner stands: the first stage that does not pass, or that every stage passes.
+# course start NN calls it at the end, so that a learner who comes back knows what to do next.
+run_next() {
+  local total="$1" n
+  for ((n = 1; n <= total; n++)); do
+    run_stage_buffered "$n"
+    if ((STAGE_FAIL > 0)); then
+      info "Where you stand: task ${n} of ${total}, ${STAGE_TITLES[n - 1]}, does not pass yet."
+      info "The guided check takes you from there: course check ${CHAPTER} --guided"
+      return 0
+    fi
+  done
+  info "Where you stand: every task of lab ${CHAPTER} passes. The full report: course check ${CHAPTER}"
+}
+
 # Entry point of a validator: reads the options, runs preflight, then the report or the guided check.
 run_validation() {
   parse_validation_args "$@"
+  require_environment
+  if [[ -n "${WORK_DIR:-}" ]]; then
+    require_lab_started "$CHAPTER" "$WORK_DIR"
+  fi
+  if [[ "$VALIDATE_MODE" == "next" ]]; then
+    if declare -F preflight >/dev/null; then
+      preflight >/dev/null
+    fi
+    run_next "${#STAGE_TITLES[@]}"
+    return 0
+  fi
   printf 'Chapter %s validation, %s UTC\n' "${CHAPTER#0}" "$(date -u '+%Y-%m-%d %H:%M')"
   if [[ "$VALIDATE_DEEP" == "1" ]]; then
     info "Live tests are on (--deep): ${DEEP_NOTICE}"

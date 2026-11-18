@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Chapter 2 validation. Run it on the lab VM:
+# Chapter 2 validation. Run it in the environment of the course:
 #   course check 02            full report
 #   course check 02 --guided   one stage at a time
 # Read-only: it reads your YAML files and the cluster, and sends GET requests to the app.
@@ -18,6 +18,7 @@ CHAPTER="02"
 NS="sample-app"
 APP="sample-app"
 NAME_LABEL="app.kubernetes.io/name"
+IMAGE_REPO="${REGISTRY_HOST}/${APP}"
 FINAL_TAG="1.0.0"
 V2_TAG="2.0.0"
 REPLICAS=5
@@ -36,7 +37,7 @@ STAGE_TITLES=(
   "Roll out version ${V2_TAG}"
   "Roll back and make your files match the cluster"
 )
-DEEP_NOTICE="they delete one pod of your Deployment to time its replacement, and run a temporary ${PROBE_IMAGE} pod that calls your Service by name, then remove it. Your files and Azure are not touched."
+DEEP_NOTICE="they delete one pod of your Deployment to time its replacement, and run a temporary ${PROBE_IMAGE} pod that calls your Service by name, then remove it. Your files and the registry are not touched."
 
 NODES_JSON=""
 FILES_JSON="[]"
@@ -49,10 +50,8 @@ k() {
 }
 
 preflight() {
-  require_lab_vm
-  load_env
-  require_cmd kubectl "Run the readiness report from your own computer: ./course check"
-  require_cmd docker "Run the readiness report from your own computer: ./course check"
+  require_cmd kubectl
+  require_cmd docker
   require_cmd jq
   require_cmd curl
   require_cmd python3
@@ -60,6 +59,7 @@ preflight() {
     die "The Python YAML module is missing. Install it with: sudo apt-get install --yes python3-yaml"
   fi
 
+  require_lab_cluster "$CHAPTER"
   step "Cluster"
   local current_context ready_nodes control_planes
   current_context="$(kubectl config current-context 2>/dev/null || true)"
@@ -70,16 +70,14 @@ preflight() {
   fi
   NODES_JSON="$(k get nodes -o json 2>/dev/null || true)"
   if [[ -z "$NODES_JSON" ]]; then
-    check_fail "Cannot reach the cluster kind-${KIND_CLUSTER_NAME}." "Run course start 02. After a VM restart, if the nodes do not come back, run course clean 02, then course start 02."
-    check_summary
-    exit 1
+    die "The cluster of lab ${CHAPTER} is not running. Run: course start ${CHAPTER}"
   fi
   ready_nodes="$(jq '[.items[] | select(any(.status.conditions[]; .type == "Ready" and .status == "True"))] | length' <<<"$NODES_JSON")"
   control_planes="$(jq '[.items[] | select(.metadata.labels | has("node-role.kubernetes.io/control-plane"))] | length' <<<"$NODES_JSON")"
   if [[ "$ready_nodes" == "3" && "$control_planes" == "1" ]]; then
     check_pass "3 nodes are Ready: 1 control plane and 2 workers."
   else
-    check_fail "${ready_nodes} Ready nodes and ${control_planes} control plane, expected 3 and 1." "Recreate the cluster: course clean 02, then course start 02."
+    check_fail "${ready_nodes} Ready nodes and ${control_planes} control plane, expected 3 and 1." "Run course start 02, which starts the nodes that are stopped. If a node stays NotReady, course clean 02 then course start 02 creates the cluster again."
   fi
 }
 
@@ -211,7 +209,7 @@ stage_1() {
 stage_2_task() {
   cat <<EOF
   In the namespace ${NS}, create a Deployment called ${APP} from a YAML file:
-  - 3 replicas of the image ${APP}:${FINAL_TAG}
+  - 3 replicas of the image ${IMAGE_REPO}:${FINAL_TAG}, from the registry of the course
   - pods labelled ${NAME_LABEL}: ${APP}, and the same label as the selector
   - container port 8080
   Apply it, then watch the pods start: kubectl -n ${NS} get pods --watch
@@ -259,11 +257,11 @@ stage_2() {
   image="$(jq -r '.spec.template.spec.containers[0].image' <<<"$deployment")"
   tag="${image##*:}"
   if [[ "${image##*/}" != *:* || "$tag" == "latest" ]]; then
-    check_fail "The Deployment runs ${image}, without a fixed tag." "With latest, or with no tag, the kubelet tries to pull the image from a registry, and yours only exists on the nodes. Name the version: ${APP}:${FINAL_TAG}."
-  elif [[ "${image%:*}" == *"$APP" && ("$tag" == "$FINAL_TAG" || "$tag" == "$V2_TAG") ]]; then
-    check_pass "The Deployment runs ${image}, an image with a fixed tag."
+    check_fail "The Deployment runs ${image}, without a fixed tag." "With latest, or with no tag, you cannot tell which build runs. Name the version: ${IMAGE_REPO}:${FINAL_TAG}."
+  elif [[ "${image%:*}" == "$IMAGE_REPO" && ("$tag" == "$FINAL_TAG" || "$tag" == "$V2_TAG") ]]; then
+    check_pass "The Deployment runs ${image}, from the registry of the course, with a fixed tag."
   else
-    check_fail "The Deployment runs ${image}, the lab uses ${APP}:${FINAL_TAG}." "Set the image in your file and apply it again."
+    check_fail "The Deployment runs ${image}, the lab uses ${IMAGE_REPO}:${FINAL_TAG}." "The nodes pull from the registry of the course, so the image name starts with ${REGISTRY_HOST}/. Set it in your file and apply it again."
   fi
 
   if [[ -n "$(jq -r '[.spec.template.spec.containers[0].ports[]?.containerPort] | index(8080) // empty' <<<"$deployment")" ]]; then
@@ -296,7 +294,7 @@ stage_3_task() {
   Expose the pods with a Service called ${APP}, from a YAML file:
   type NodePort, port 80, sending traffic to port 8080 of the pods,
   node port ${NODE_PORT}, selecting the pods by their label.
-  Then call the app several times from the VM, through a node address,
+  Then call the app several times from the environment, through a node address,
   and look at the host names in the answers:
     kubectl get nodes -o wide      then      curl http://<node address>:${NODE_PORT}/
   Details: chapter 2 page, Lab, task 3.
@@ -562,7 +560,7 @@ stage_5() {
 stage_6_task() {
   cat <<EOF
   Build ${APP}:${V2_TAG} from your chapter 1 Dockerfile, with the version set to ${V2_TAG},
-  and load it into the cluster. Then change the image in your Deployment file and apply it.
+  and push it as ${IMAGE_REPO}:${V2_TAG}. Then change the image in your Deployment file and apply it.
   Watch the rollout, and call the app while it runs:
     kubectl -n ${NS} rollout status deployment/${APP}
     kubectl -n ${NS} get replicasets
@@ -571,25 +569,17 @@ EOF
 }
 
 stage_6() {
-  local deployment replicasets count node loaded=0 workers=0 wanted updated ready current
+  local deployment replicasets count wanted updated ready current
   if docker image inspect "${APP}:${V2_TAG}" >/dev/null 2>&1; then
-    check_pass "The image ${APP}:${V2_TAG} exists on the lab VM."
+    check_pass "The image ${APP}:${V2_TAG} exists in Docker."
   else
     check_fail "No local image named ${APP}:${V2_TAG}." "Build it as in chapter 1, with the version and the tag set to ${V2_TAG}."
   fi
 
-  while IFS= read -r node; do
-    [[ -n "$node" ]] || continue
-    workers=$((workers + 1))
-    if docker exec "$node" crictl images --output json 2>/dev/null |
-      jq -e --arg tag "${APP}:${V2_TAG}" 'any(.images[]?.repoTags[]?; . == $tag or endswith("/" + $tag))' >/dev/null 2>&1; then
-      loaded=$((loaded + 1))
-    fi
-  done <<<"$(jq -r '.items[] | select(.metadata.labels | has("node-role.kubernetes.io/control-plane") | not) | .metadata.name' <<<"$NODES_JSON")"
-  if ((workers > 0 && loaded == workers)); then
-    check_pass "The image ${APP}:${V2_TAG} is loaded on the ${workers} worker nodes."
+  if registry_has_tag "$APP" "$V2_TAG"; then
+    check_pass "The registry holds ${IMAGE_REPO}:${V2_TAG}."
   else
-    check_fail "The image ${APP}:${V2_TAG} is loaded on ${loaded} of ${workers} worker nodes." "The nodes do not see the images of Docker on the VM. Load it: kind load docker-image ${APP}:${V2_TAG} --name ${KIND_CLUSTER_NAME}"
+    check_fail "The registry does not hold ${IMAGE_REPO}:${V2_TAG}." "The nodes only see what the registry holds. Tag the image ${IMAGE_REPO}:${V2_TAG} and push it."
   fi
 
   deployment="$(deployment_json)"
@@ -602,7 +592,7 @@ stage_6() {
   if jq -e --arg tag ":${V2_TAG}" 'any(.[]; .spec.template.spec.containers[0].image | endswith($tag))' <<<"$replicasets" >/dev/null; then
     check_pass "Version ${V2_TAG} was rolled out: one of the ${count} ReplicaSets of the Deployment runs or ran that image."
   else
-    check_fail "No ReplicaSet of the Deployment ever ran version ${V2_TAG}." "Change the image in your Deployment file to ${APP}:${V2_TAG} and apply it."
+    check_fail "No ReplicaSet of the Deployment ever ran version ${V2_TAG}." "Change the image in your Deployment file to ${IMAGE_REPO}:${V2_TAG} and apply it."
   fi
 
   wanted="$(jq -r '.spec.replicas' <<<"$deployment")"
@@ -612,7 +602,7 @@ stage_6() {
   if [[ "$updated" == "$wanted" && "$ready" == "$wanted" && "$current" == "$wanted" ]]; then
     check_pass "No rollout is in progress: all ${wanted} pods run the current version and are ready."
   else
-    check_fail "A rollout is in progress or stuck: ${updated} of ${wanted} pods updated, ${ready} ready, ${current} in total." "Follow it with: kubectl -n ${NS} rollout status deployment/${APP}. ErrImagePull on the new pods means the image is not loaded into the cluster."
+    check_fail "A rollout is in progress or stuck: ${updated} of ${wanted} pods updated, ${ready} ready, ${current} in total." "Follow it with: kubectl -n ${NS} rollout status deployment/${APP}. ErrImagePull on the new pods means the registry does not hold that image."
   fi
 }
 

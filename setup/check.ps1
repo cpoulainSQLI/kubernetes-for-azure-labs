@@ -1,352 +1,149 @@
 <#
 .SYNOPSIS
-Readiness report of the lab environment. Read-only: it changes nothing in Azure or on the lab VM.
+Readiness report of the environment of the course on Windows. Read-only: it changes nothing.
 
 .DESCRIPTION
-Run it on your own computer, from the kit folder:
-  .\course.ps1 check
-Prints PASS, FAIL or WARN for each check. Exit code 0 when no check fails, 1 otherwise.
-The bash version, check.sh, runs the same checks on macOS and Linux.
+Run it from the kit folder: .\course.ps1 check
+It checks WSL and the course's WSL distribution from Windows, then reads the tools, the registry, the kit and
+the cluster inside the distribution. setup/check.sh runs the same checks inside the environment, with the same IDs.
+Exit code 0 when no check fails, 1 otherwise.
 #>
 [CmdletBinding()]
 param()
 
-. (Join-Path $PSScriptRoot '../lib/lib.ps1')
+. (Join-Path (Join-Path $PSScriptRoot '..') 'lib/lib.ps1')
 
-$Chapter = $SetupChapter
+Write-Info ("Readiness report, {0} UTC" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm'))
 
-Read-CourseSetting
-Assert-Command 'az' 'Install the Azure CLI: https://learn.microsoft.com/cli/azure/install-azure-cli'
-Assert-Command 'ssh' 'Install the OpenSSH client.'
-
-Write-Info ("Readiness report, {0} UTC" -f (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm', $Invariant))
-
-# ---------------------------------------------------------------------------
-Write-Step 'Azure CLI and subscription'
-# check: cli-signed-in
-if (-not (Test-AzSignedIn)) {
-    Add-Fail 'The Azure CLI is not signed in.' 'Run: az login'
+Write-Step 'Platform'
+# check: platform
+$wslVersion = Invoke-Wsl @('--version')
+if (-not (Test-Command 'wsl.exe') -or $wslVersion.ExitCode -ne 0) {
+    Add-Fail 'WSL is not installed, or too old to report its version.' 'From an administrator PowerShell: wsl --install, then restart Windows. An old WSL updates with: wsl --update'
     Complete-CheckRun
 }
-Add-Pass 'The Azure CLI is signed in.'
+Add-Pass "Windows $([Environment]::OSVersion.Version), $(($wslVersion.Output -split "`n")[0])."
 
-$account = Get-AzJson @('account', 'show')
-$subId = Get-Prop $account 'id'
-$subName = Get-Prop $account 'name'
-$subState = Get-Prop $account 'state'
-# check: subscription-match
-if ($Config.AZURE_SUBSCRIPTION -and $Config.AZURE_SUBSCRIPTION -ne $subName -and $Config.AZURE_SUBSCRIPTION -ne $subId) {
-    Add-Fail "The CLI points at '$subName', not at AZURE_SUBSCRIPTION from .env." 'Run: az account set --subscription "<value of AZURE_SUBSCRIPTION>"'
-}
-else {
-    Add-Pass "Subscription in use: $subName."
-}
-# check: subscription-state
-if ($subState -eq 'Enabled') {
-    Add-Pass 'The subscription is Enabled.'
-}
-else {
-    Add-Fail "The subscription is $subState." 'A spent credit disables the subscription until the next billing period.'
-}
-
-# check: spending-limit
-$subscription = Get-AzJson @('rest', '--method', 'get', '--url', "https://management.azure.com/subscriptions/${subId}?api-version=2022-12-01")
-$spendingLimit = Get-Prop $subscription 'subscriptionPolicies.spendingLimit'
-$quotaId = Get-Prop $subscription 'subscriptionPolicies.quotaId'
-if (-not $quotaId) { $quotaId = 'unknown' }
-switch ($spendingLimit) {
-    'On' { Add-Pass "The spending limit is on (offer: $quotaId)." }
-    'Off' { Add-Warn "The spending limit is off (offer: $quotaId)." 'Charges continue past the credit amount. Rely on the budget alerts and stop resources quickly.' }
-    default { Add-Warn "Could not read the spending limit (offer: $quotaId)." 'Check it in the portal under Subscriptions, Overview.' }
-}
-
-# ---------------------------------------------------------------------------
-Write-Step "Region $($Config.REGION)"
-# check: region-vm-size
-$skus = @(Get-AzJson @('vm', 'list-skus', '--location', $Config.REGION, '--size', $Config.VM_SIZE, '--resource-type', 'virtualMachines'))
-$sku = $skus | Where-Object { $null -ne $_ -and $_.name -eq $Config.VM_SIZE } | Select-Object -First 1
-$restrictions = @(Get-Prop $sku 'restrictions') | Where-Object { $null -ne $_ }
-if (-not $sku) {
-    Add-Fail "$($Config.VM_SIZE) is not offered in $($Config.REGION)." 'Pick another REGION or VM_SIZE in .env.'
-}
-elseif (@($restrictions).Count -gt 0) {
-    Add-Fail "$($Config.VM_SIZE) is restricted for this subscription in $($Config.REGION) ($((@($restrictions) | ForEach-Object { $_.reasonCode }) -join ', '))." 'Pick another REGION or VM_SIZE in .env.'
-}
-else {
-    Add-Pass "$($Config.VM_SIZE) is available in $($Config.REGION)."
-}
-
-# check: region-aks-aro
-$regionDisplay = Get-AzValue @('account', 'list-locations', '--query', "[?name=='$($Config.REGION)'].displayName | [0]")
-$offers = @(
-    @{ Namespace = 'Microsoft.ContainerService'; Type = 'managedClusters'; Label = 'AKS (chapter 6)' },
-    @{ Namespace = 'Microsoft.RedHatOpenShift'; Type = 'OpenShiftClusters'; Label = 'ARO (chapters 8 and 9)' }
-)
-foreach ($offer in $offers) {
-    $provider = Get-AzJson @('provider', 'show', '--namespace', $offer.Namespace)
-    $type = @(Get-Prop $provider 'resourceTypes') | Where-Object { $null -ne $_ -and $_.resourceType -eq $offer.Type } | Select-Object -First 1
-    $locations = @(Get-Prop $type 'locations')
-    if ($regionDisplay -and ($locations | Where-Object { $_ -eq $regionDisplay })) {
-        Add-Pass "$($offer.Label) is offered in $regionDisplay."
-    }
-    else {
-        Add-Warn "$($offer.Label) does not list $($Config.REGION) as a location." 'Choose a region that offers it before that chapter.'
-    }
-}
-
-# ---------------------------------------------------------------------------
-Write-Step 'Resource providers'
-# check: providers-now
-foreach ($namespace in @('Microsoft.Compute', 'Microsoft.Network', 'Microsoft.Storage', 'Microsoft.DevTestLab', 'Microsoft.ContainerRegistry', 'Microsoft.Consumption')) {
-    $state = Get-AzValue @('provider', 'show', '--namespace', $namespace, '--query', 'registrationState')
-    if (-not $state) { $state = 'Unknown' }
-    if ($state -eq 'Registered') { Add-Pass "$namespace is registered (needed now)." }
-    else { Add-Fail "$namespace is $state (needed now)." "Run .\course.ps1 up -Apply, or: az provider register --namespace $namespace" }
-}
-# check: providers-later
-foreach ($namespace in @('Microsoft.ContainerService', 'Microsoft.RedHatOpenShift', 'Microsoft.Authorization', 'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights')) {
-    $state = Get-AzValue @('provider', 'show', '--namespace', $namespace, '--query', 'registrationState')
-    if (-not $state) { $state = 'Unknown' }
-    if ($state -eq 'Registered') { Add-Pass "$namespace is registered (needed later)." }
-    else { Add-Warn "$namespace is $state (needed later)." "Register it before the chapter that uses it: az provider register --namespace $namespace" }
-}
-
-# ---------------------------------------------------------------------------
-Write-Step "vCPU quotas in $($Config.REGION)"
-$usage = @(Get-AzJson @('vm', 'list-usage', '--location', $Config.REGION)) | Where-Object { $null -ne $_ }
-function Get-Quota([string]$Name) {
-    $line = $usage | Where-Object { (Get-Prop $_ 'name.value') -eq $Name } | Select-Object -First 1
-    if (-not $line) { return $null }
-    return [pscustomobject]@{ Used = [int]$line.currentValue; Limit = [int]$line.limit }
-}
-$regional = Get-Quota 'cores'
-$dasv5 = Get-Quota 'standardDASv5Family'
-$dsv5 = Get-Quota 'standardDSv5Family'
-
-# check: quota-regional
-# check: quota-regional-aro
-if (-not $regional) {
-    Add-Fail 'Could not read the regional vCPU quota.' "Run: az vm list-usage --location $($Config.REGION) --output table"
-}
-else {
-    if ($regional.Limit -ge 2) { Add-Pass "Total regional vCPUs: $($regional.Used) used of $($regional.Limit) (the lab VM needs 2)." }
-    else { Add-Fail "Total regional vCPUs: limit $($regional.Limit), the lab VM needs 2." 'Request an increase under Quotas in the portal.' }
-    if ($regional.Limit -lt 46) {
-        Add-Warn "Total regional vCPU limit is $($regional.Limit). ARO needs 44 vCPUs at install time, plus 2 for the lab VM." 'Request 46 or more before chapter 8. Credit-based subscriptions may not get it, see the course page on quotas (azure-limits.html).'
-    }
-    else { Add-Pass "Total regional vCPU limit $($regional.Limit) covers ARO (44) and the lab VM (2)." }
-}
-# check: quota-dasv5
-if (-not $dasv5) { Add-Warn 'Could not read the DASv5 family quota.' "Run: az vm list-usage --location $($Config.REGION) --output table" }
-elseif ($dasv5.Limit -ge 2) { Add-Pass "DASv5 family vCPUs: $($dasv5.Used) used of $($dasv5.Limit) (lab VM size)." }
-else { Add-Fail "DASv5 family vCPU limit is $($dasv5.Limit), the lab VM needs 2." 'Request an increase for Standard DASv5 Family vCPUs.' }
-# check: quota-dsv5
-if (-not $dsv5) { Add-Warn 'Could not read the DSv5 family quota.' "Run: az vm list-usage --location $($Config.REGION) --output table" }
-elseif ($dsv5.Limit -ge 44) { Add-Pass "DSv5 family vCPUs: $($dsv5.Used) used of $($dsv5.Limit), enough for the default ARO node sizes (44 at install time)." }
-else { Add-Warn "DSv5 family vCPU limit is $($dsv5.Limit). The default ARO node sizes need 44 at install time." 'Request an increase for Standard DSv5 Family vCPUs before chapter 8.' }
-
-# ---------------------------------------------------------------------------
-Write-Step 'Terraform and its state'
-# check: terraform-cli
-$tfVersion = ''
-if (Test-Command 'terraform') { $tfVersion = Get-TerraformVersion }
-if (-not $tfVersion) { Add-Fail 'Terraform is not installed on this computer.' 'Install it: https://developer.hashicorp.com/terraform/install' }
-elseif ([version]$tfVersion -ge [version]$TerraformMinVersion) { Add-Pass "Terraform $tfVersion is installed." }
-else { Add-Fail "Terraform $tfVersion is installed, the course needs $TerraformMinVersion or later." 'Install a newer version: https://developer.hashicorp.com/terraform/install' }
-
-# check: tfstate-storage
-$stateAccount = Get-StateAccountName $subId
-$stateInfo = Get-AzJson @('storage', 'account', 'show', '--resource-group', (Get-StateRgName), '--name', $stateAccount)
-if (-not $stateInfo) { Add-Fail "No Terraform state storage account $stateAccount in $(Get-StateRgName)." 'Run .\course.ps1 up.' }
-elseif ((Get-Prop $stateInfo 'tags.course') -eq $CourseTagValue -and (Get-Prop $stateInfo 'tags.chapter') -eq $Chapter -and (Get-Prop $stateInfo 'allowSharedKeyAccess') -eq $false) {
-    Add-Pass "State storage account $stateAccount has the course tags and refuses account keys."
-}
-else { Add-Warn "State storage account $stateAccount is missing the course tags or accepts account keys." 'Run .\course.ps1 up -Apply.' }
-
-# check: tfstate-blob
-$blobExists = ''
-if ($stateInfo) {
-    $blobExists = Get-AzValue @('storage', 'blob', 'exists', '--account-name', $stateAccount, '--container-name', $StateContainer,
-        '--name', "$SetupFolder.tfstate", '--auth-mode', 'login', '--query', 'exists')
-}
-if ($blobExists -eq 'true') { Add-Pass "The state of the setup is in $stateAccount/$StateContainer, and your account can read it." }
-else { Add-Fail 'The state of the setup is missing, or your account cannot read it.' 'Run .\course.ps1 up. A new role can take up to 10 minutes to apply.' }
-
-# ---------------------------------------------------------------------------
-Write-Step 'Budget'
-# check: budget-exists
-# check: budget-amount
-# check: budget-alerts
-# check: budget-forecast
-$budget = Get-AzJson @('rest', '--method', 'get', '--url', (Get-BudgetUrl $subId))
-if (-not $budget) {
-    Add-Fail "Budget $(Get-BudgetName) not found." 'Run .\course.ps1 up.'
-}
-else {
-    $amount = [int][double](Get-Prop $budget 'properties.amount')
-    if ($amount -eq [int]$Config.BUDGET_AMOUNT) { Add-Pass "Budget $(Get-BudgetName): $($Config.BUDGET_AMOUNT) $($Config.CURRENCY), $(Get-Prop $budget 'properties.timeGrain')." }
-    else { Add-Warn "Budget amount is $amount, .env says $($Config.BUDGET_AMOUNT)." 'Run .\course.ps1 up -Apply to apply the amount from .env.' }
-    $notifications = Get-Prop $budget 'properties.notifications'
-    $alerts = @()
-    if ($notifications) { $alerts = @($notifications.PSObject.Properties | ForEach-Object { $_.Value }) }
-    if ($alerts.Count -ge 1) { Add-Pass "The budget has $($alerts.Count) alerts." }
-    else { Add-Fail 'The budget has no alerts.' 'Run .\course.ps1 up -Apply.' }
-    if (@($alerts | Where-Object { (Get-Prop $_ 'thresholdType') -eq 'Forecasted' }).Count -ge 1) { Add-Pass 'The budget has a forecast alert.' }
-    else { Add-Warn 'The budget has no forecast alert.' 'Forecast alerts warn you before the money is spent.' }
-}
-
-# ---------------------------------------------------------------------------
-Write-Step 'Lab resources and tags'
-$rg = Get-RgName
-$vm = Get-VmName
-# check: rg-tags
-$group = Get-AzJson @('group', 'show', '--name', $rg)
-if (-not $group) {
-    Add-Fail "Resource group $rg not found." 'Run .\course.ps1 up.'
+# check: environment
+$state = Get-DistroState
+if (-not $state) {
+    Add-Fail "The WSL distribution $DistroName does not exist." 'Create it with: .\course.ps1 up'
     Complete-CheckRun
 }
-if ((Get-Prop $group 'tags.course') -eq $CourseTagValue -and (Get-Prop $group 'tags.chapter') -eq $Chapter) {
-    Add-Pass "Resource group $rg has the tags $CourseTagKey=$CourseTagValue and chapter=$Chapter."
-}
-else {
-    Add-Fail "Resource group $rg is missing the course tags." 'Run .\course.ps1 up -Apply.'
-}
-
-# check: vm-tags
-# check: vm-size
-$vmInfo = Get-AzJson @('vm', 'show', '--resource-group', $rg, '--name', $vm)
-if (-not $vmInfo) {
-    Add-Fail "Lab VM $vm not found." 'Run .\course.ps1 up.'
+if ((Get-DistroWslVersion) -ne '2') {
+    Add-Fail "The distribution $DistroName runs on WSL 1. kind needs WSL 2." "Convert it with: wsl --set-version $DistroName 2"
     Complete-CheckRun
 }
-if ((Get-Prop $vmInfo 'tags.course') -eq $CourseTagValue -and (Get-Prop $vmInfo 'tags.chapter') -eq $Chapter) { Add-Pass "Lab VM $vm has the course tags." }
-else { Add-Fail "Lab VM $vm is missing the course tags." 'Run .\course.ps1 up -Apply.' }
-$vmSize = Get-Prop $vmInfo 'hardwareProfile.vmSize'
-if ($vmSize -eq $Config.VM_SIZE) { Add-Pass "Lab VM size is $vmSize." }
-else { Add-Warn "Lab VM size is $vmSize, .env says $($Config.VM_SIZE)." 'Run .\course.ps1 up -Apply to align them.' }
+if ($state -ne 'Running') { Write-Info "The distribution is $state. The report starts it, as a terminal would." }
 
-# check: untagged
-$untagged = @(@(Get-AzJson @('resource', 'list', '--resource-group', $rg)) | Where-Object {
-        $null -ne $_ -and (Get-Prop $_ 'tags.course') -ne $CourseTagValue -and $_.type -ne 'Microsoft.Compute/disks'
-    } | ForEach-Object { $_.name })
-if ($untagged.Count -eq 0) { Add-Pass "Every resource in $rg carries the course tag (the OS disk is checked through the VM)." }
-else { Add-Warn "Resources without the course tag in ${rg}: $($untagged -join ' ')" 'Tag them or delete them, so teardown can find them.' }
-
-# check: auto-shutdown
-$shutdown = Get-AzJson @('resource', 'show', '--resource-group', $rg, '--resource-type', 'Microsoft.DevTestLab/schedules', '--name', "shutdown-computevm-$vm")
-if (-not $shutdown) { Add-Fail "No auto-shutdown schedule on $vm." 'Run .\course.ps1 up -Apply.' }
-elseif ((Get-Prop $shutdown 'properties.status') -eq 'Enabled') {
-    Add-Pass "Auto-shutdown is enabled at $(Get-Prop $shutdown 'properties.dailyRecurrence.time') ($(Get-Prop $shutdown 'properties.timeZoneId'))."
-}
-else { Add-Fail "Auto-shutdown is $(Get-Prop $shutdown 'properties.status')." 'Run .\course.ps1 up -Apply.' }
-
-# check: nsg
-$rules = @(@(Get-AzJson @('network', 'nsg', 'rule', 'list', '--resource-group', $rg, '--nsg-name', "$vm-nsg")) | Where-Object {
-        $null -ne $_ -and $_.direction -eq 'Inbound' -and $_.access -eq 'Allow'
-    })
-$sshRules = @($rules | Where-Object { $_.destinationPortRange -eq '22' })
-if ($rules.Count -eq 1 -and $sshRules.Count -eq 1 -and $sshRules[0].sourceAddressPrefix -eq "$($Config.LEARNER_IP)/32") {
-    Add-Pass 'The NSG allows SSH (port 22) from LEARNER_IP only.'
-}
-elseif ($sshRules.Count -ge 1) {
-    Add-Fail 'The NSG inbound rules do not match LEARNER_IP from .env, or allow more than SSH.' 'If your IP changed, update LEARNER_IP in .env and run .\course.ps1 up again.'
-}
-else { Add-Fail 'No NSG rule allows SSH to the lab VM.' 'Run .\course.ps1 up -Apply.' }
-
-# check: identity-roles
-$principalId = Get-Prop $vmInfo 'identity.principalId'
-if ($principalId) {
-    $roles = @(@(Get-AzJson @('role', 'assignment', 'list', '--assignee', $principalId, '--scope', (Get-Prop $group 'id'))) | Where-Object { $null -ne $_ } | ForEach-Object { $_.roleDefinitionName })
-    $stateRoles = @()
-    if ($stateInfo) {
-        $stateRoles = @(@(Get-AzJson @('role', 'assignment', 'list', '--assignee', $principalId, '--scope', (Get-Prop $stateInfo 'id'))) | Where-Object { $null -ne $_ } | ForEach-Object { $_.roleDefinitionName })
-    }
-    if ($roles -contains 'Contributor' -and $roles -contains 'AcrPush' -and $stateRoles -contains 'Storage Blob Data Contributor') {
-        Add-Pass "The VM managed identity has Contributor and AcrPush on $rg, and Storage Blob Data Contributor on the state storage."
-    }
-    else { Add-Fail "The VM managed identity lacks Contributor or AcrPush on $rg, or Storage Blob Data Contributor on the state storage." 'Run .\course.ps1 up -Apply. Role assignments can take up to 10 minutes to appear.' }
-}
-else {
-    Add-Fail 'The lab VM has no managed identity.' 'Run .\course.ps1 up -Apply.'
-}
-
-# ---------------------------------------------------------------------------
-Write-Step 'Tools on the lab VM'
-# check: vm-running
-$powerState = Get-PowerState
-if ($powerState -ne 'PowerState/running') {
-    Add-Warn "The lab VM is $($powerState -replace 'PowerState/', ''), so the tool checks were skipped." 'Start it with: .\course.ps1 up, then run this report again.'
-    Complete-CheckRun
-}
-Add-Pass 'The lab VM is running.'
-
-# check: vm-ssh
-$remoteScript = @'
-set -u
-printf 'marker=%s\n' "$(test -f /etc/aro-k8s/tools-ready && echo yes || echo no)"
-printf 'cloudinit=%s\n' "$(cloud-init status 2>/dev/null | awk '{print $2}')"
-printf 'docker=%s\n' "$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo missing)"
-printf 'kind=%s\n' "$(kind version 2>/dev/null | awk '{print $2}' || echo missing)"
-printf 'kubectl=%s\n' "$(kubectl version --client -o json 2>/dev/null | jq -r '.clientVersion.gitVersion' 2>/dev/null || echo missing)"
-printf 'az=%s\n' "$(az version --query '"azure-cli"' --output tsv 2>/dev/null || echo missing)"
-printf 'git=%s\n' "$(git --version 2>/dev/null | awk '{print $3}' || echo missing)"
-printf 'jq=%s\n' "$(jq --version 2>/dev/null || echo missing)"
-printf 'terraform=%s\n' "$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p' || echo missing)"
-printf 'watches=%s\n' "$(sysctl -n fs.inotify.max_user_watches 2>/dev/null || echo 0)"
-printf 'kit=%s\n' "$(git -C ~/aro-k8s-course rev-parse --short HEAD 2>/dev/null || echo missing)"
-printf 'env=%s\n' "$(test -f ~/aro-k8s-course/.env && echo yes || echo no)"
-printf 'launcher=%s\n' "$(command -v course >/dev/null 2>&1 && echo yes || echo no)"
-exit 0
+# Everything inside the distribution, read in one call, one key=value per line.
+$probe = @'
+source ~/__KIT_NAME__/lib/lib.sh 2>/dev/null || { echo kit_lib=missing; exit 0; }
+echo "user=$(id -un)"
+echo "marker=$(in_course_wsl && echo yes || echo no)"
+echo "pid1=$(ps -p 1 -o comm= 2>/dev/null)"
+echo "docker_cli=$(command -v docker >/dev/null 2>&1 && echo yes || echo no)"
+echo "docker_ok=$(docker info >/dev/null 2>&1 && echo yes || echo no)"
+echo "docker_version=$(docker_version)"
+echo "docker_os=$(docker info --format '{{.OperatingSystem}}' 2>/dev/null)"
+echo "kind=$(kind_version)"
+echo "kubectl=$(kubectl_version)"
+missing=""
+for tool in git curl jq python3; do command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"; done
+python3 -c 'import yaml' 2>/dev/null || missing="$missing python3-yaml"
+echo "missing=${missing# }"
+echo "inotify=$(sysctl -n fs.inotify.max_user_watches 2>/dev/null || echo 0)"
+echo "registry=$(registry_state)"
+echo "registry_http=$(curl -fsS --max-time 5 "http://${REGISTRY_HOST}/v2/" >/dev/null 2>&1 && echo yes || echo no)"
+echo "registry_volume=$(docker container inspect --format '{{range .Mounts}}{{.Name}} {{end}}' "$REGISTRY_NAME" 2>/dev/null | grep -qw "$REGISTRY_VOLUME" && echo yes || echo no)"
+echo "kit=$(git -C ~/__KIT_NAME__ rev-parse --short HEAD 2>/dev/null)"
+echo "course_cmd=$(command -v course)"
+if cluster_exists; then
+  echo "cluster=yes"
+  echo "cluster_lab=$(cluster_lab)"
+  echo "stopped=$(cluster_nodes_state | awk '$2 != "running" {print $1}' | tr '\n' ' ')"
+  echo "api=$(kubectl --context "$KUBE_CONTEXT" get nodes >/dev/null 2>&1 && echo yes || echo no)"
+else
+  echo "cluster=no"
+fi
 '@
-$report = Get-LabSshOutput -RemoteCommand 'bash -s' -InputText $remoteScript
-if (-not $report) {
-    Add-Fail 'Could not connect to the lab VM over SSH.' 'Check LEARNER_IP in .env against your current public IP, then run .\course.ps1 up again.'
+$values = @{}
+foreach ($line in (Invoke-InDistroScript $probe.Replace('__KIT_NAME__', $KitName)).Output -split "`n") {
+    if ($line -match '^([a-z_0-9]+)=(.*)$') { $values[$Matches[1]] = $Matches[2].Trim() }
+}
+function Get-Value([string]$Key) { if ($values.ContainsKey($Key)) { return $values[$Key] } return '' }
+
+if ((Get-Value 'kit_lib') -eq 'missing') {
+    Add-Fail "The kit is missing in $DistroName (~/$KitName)." "Read the install log: wsl -d $DistroName -u root -- tail -n 50 /var/log/$KitName-install.log"
     Complete-CheckRun
 }
-$values = @{}
-foreach ($line in $report -split "`n") {
-    if ($line -match '^([a-z]+)=(.*)$') { $values[$Matches[1]] = $Matches[2].Trim() }
+if ((Get-Value 'user') -eq $LinuxUser -and (Get-Value 'marker') -eq 'yes') {
+    Add-Pass "The distribution $DistroName runs on WSL 2, and you log in as $LinuxUser."
 }
-function Get-VmValue([string]$Key) { if ($values.ContainsKey($Key)) { return $values[$Key] } return '' }
+else {
+    Add-Fail "The distribution $DistroName logs in as '$(Get-Value 'user')', or was not built by course up." "Stop it with .\course.ps1 stop and run .\course.ps1 up. If that does not help: .\course.ps1 destroy, then .\course.ps1 up"
+}
+# check: systemd
+if ((Get-Value 'pid1') -eq 'systemd') { Add-Pass 'systemd runs, so Docker Engine starts with the distribution.' }
+else { Add-Warn 'systemd does not run in the distribution, so nothing starts Docker Engine by itself.' 'Stop the distribution with .\course.ps1 stop, then connect again.' }
 
-# check: tools-cloud-init
-if ((Get-VmValue 'marker') -eq 'yes') { Add-Pass "cloud-init finished installing the tools ($(Get-VmValue 'cloudinit'))." }
-else { Add-Fail "cloud-init has not finished installing the tools (status: $(Get-VmValue 'cloudinit'))." 'On the VM: sudo tail -n 50 /var/log/aro-k8s-install.log' }
-# check: tools-docker
-$dockerVersion = Get-VmValue 'docker'
-if ($dockerVersion -and $dockerVersion -ne 'missing') { Add-Pass "Docker Engine $dockerVersion answers without sudo." }
-else { Add-Fail "Docker does not answer for $($Config.ADMIN_USERNAME) without sudo." 'Reconnect to the VM (group membership applies to new sessions) or read the install log.' }
-# check: tools-kind
-$kindVersion = Get-VmValue 'kind'
-if ($kindVersion -eq $PinnedKindVersion) { Add-Pass "kind $kindVersion is installed." }
-elseif (-not $kindVersion -or $kindVersion -eq 'missing') { Add-Fail 'kind is missing.' 'Read the install log on the VM.' }
-else { Add-Warn "kind $kindVersion is installed, the course expects $PinnedKindVersion." 'Chapter 2 may behave differently.' }
-# check: tools-kubectl
-$kubectlVersion = Get-VmValue 'kubectl'
-if ($kubectlVersion.StartsWith("$PinnedKubectlMinor.")) { Add-Pass "kubectl $kubectlVersion is installed." }
-elseif (-not $kubectlVersion -or $kubectlVersion -eq 'missing') { Add-Fail 'kubectl is missing.' 'Read the install log on the VM.' }
-else { Add-Warn "kubectl $kubectlVersion is installed, the course expects $PinnedKubectlMinor.x." 'kubectl works with clusters one minor version older or newer.' }
-# check: tools-terraform
-$terraformVmVersion = Get-VmValue 'terraform'
-if ($terraformVmVersion -eq $PinnedTerraformVersion) { Add-Pass "Terraform $terraformVmVersion is installed." }
-elseif (-not $terraformVmVersion -or $terraformVmVersion -eq 'missing') { Add-Fail 'Terraform is missing on the lab VM.' 'Read the install log on the VM.' }
-else { Add-Warn "Terraform $terraformVmVersion is installed, the course expects $PinnedTerraformVersion." 'Later chapters may behave differently.' }
-# check: tools-other
-foreach ($tool in @('az', 'git', 'jq')) {
-    $toolVersion = Get-VmValue $tool
-    if ($toolVersion -and $toolVersion -ne 'missing') { Add-Pass "$tool $toolVersion is installed." }
-    else { Add-Fail "$tool is missing on the lab VM." 'Read the install log on the VM.' }
+Write-Step 'Tools'
+# check: docker
+if ((Get-Value 'docker_cli') -ne 'yes') {
+    Add-Fail "Docker is not installed in $DistroName." 'Run: .\course.ps1 up'
 }
+elseif ((Get-Value 'docker_ok') -ne 'yes') {
+    Add-Fail "Docker Engine does not answer in $DistroName." 'Stop the distribution with .\course.ps1 stop, then run .\course.ps1 check again.'
+}
+else {
+    Add-Pass "Docker Engine $(Get-Value 'docker_version') answers. The course does not pin its version."
+    # check: docker-engine
+    if ((Get-Value 'docker_os') -like '*Docker Desktop*') {
+        Add-Warn 'The docker command reaches Docker Desktop, not the own Docker Engine of the distribution.' "In Docker Desktop, open Settings, Resources, WSL integration, and turn it off for $DistroName."
+    }
+    else { Add-Pass "Docker runs on $(Get-Value 'docker_os')." }
+}
+# check: kind
+$found = Get-Value 'kind'
+if ($found -eq $PinnedKindVersion) { Add-Pass "kind $found." }
+elseif ($found) { Add-Warn "kind $found, and the course pins $PinnedKindVersion." 'Run: .\course.ps1 destroy, then .\course.ps1 up' }
+else { Add-Fail 'kind is not installed.' 'Run: .\course.ps1 up' }
+# check: kubectl
+$found = Get-Value 'kubectl'
+if ($found -like "$PinnedKubectlMinor.*") { Add-Pass "kubectl $found." }
+elseif ($found) { Add-Warn "kubectl $found, and the course pins $PinnedKubectlMinor." 'Run: .\course.ps1 destroy, then .\course.ps1 up' }
+else { Add-Fail 'kubectl is not installed.' 'Run: .\course.ps1 up' }
+# check: tools-other
+if (-not (Get-Value 'missing')) { Add-Pass 'git, curl, jq and the YAML module of Python are installed.' }
+else { Add-Fail "Missing in ${DistroName}: $(Get-Value 'missing')." 'Run: .\course.ps1 up' }
 # check: inotify
 $watches = 0
-[void][int]::TryParse((Get-VmValue 'watches'), [ref]$watches)
-if ($watches -ge 524288) { Add-Pass 'inotify limits are raised for kind.' }
-else { Add-Warn 'inotify limits are at the Ubuntu default.' 'On the VM: sudo sysctl --system' }
-# check: kit-on-vm
-$kitCommit = Get-VmValue 'kit'
-if ($kitCommit -and $kitCommit -ne 'missing' -and (Get-VmValue 'env') -eq 'yes' -and (Get-VmValue 'launcher') -eq 'yes') {
-    Add-Pass "The kit is cloned in ~/$VmCourseDir on the lab VM (commit $kitCommit), with your .env, and course is on the PATH."
+[void][int]::TryParse((Get-Value 'inotify'), [ref]$watches)
+if ($watches -ge 524288) { Add-Pass "inotify allows $watches watches, enough for a kind cluster of three nodes." }
+else { Add-Warn "inotify allows $watches watches. A kind cluster of three nodes may fail to start." 'Run: .\course.ps1 destroy, then .\course.ps1 up' }
+
+Write-Step 'Registry, kit and cluster'
+# check: registry
+$registry = Get-Value 'registry'
+if ($registry -eq 'running' -and (Get-Value 'registry_http') -eq 'yes') {
+    if ((Get-Value 'registry_volume') -eq 'yes') { Add-Pass "The registry $RegistryName answers on localhost:$RegistryPort, with its data in its volume." }
+    else { Add-Warn "The registry $RegistryName answers on localhost:$RegistryPort, but keeps its data outside its volume." "In the distribution: docker rm --force $RegistryName, then course up. The images you pushed are lost." }
 }
-else { Add-Fail 'The kit, its .env or the course command is missing on the lab VM.' 'Run: .\course.ps1 up' }
+elseif ($registry) { Add-Fail "The registry $RegistryName is $registry, or does not answer on localhost:$RegistryPort." 'Run: .\course.ps1 up. It starts the registry.' }
+else { Add-Fail "The registry $RegistryName does not exist." 'Run: .\course.ps1 up' }
+# check: kit
+if ((Get-Value 'kit') -and (Get-Value 'course_cmd')) { Add-Pass "The kit is cloned in ~/$KitName (commit $(Get-Value 'kit')), and course is on the PATH of the distribution." }
+else { Add-Fail "The kit or the course command is missing in $DistroName." "Read the install log: wsl -d $DistroName -u root -- tail -n 50 /var/log/$KitName-install.log" }
+# check: cluster
+if ((Get-Value 'cluster') -ne 'yes') {
+    Add-Pass 'No kind cluster runs now. A lab that needs one creates it with course start NN.'
+}
+else {
+    $lab = Get-Value 'cluster_lab'
+    if (-not $lab) { $lab = 'NN' }
+    if ((Get-Value 'stopped')) { Add-Warn "The cluster of lab $lab has stopped nodes: $(Get-Value 'stopped')." "In the distribution, bring it back with: course start $lab" }
+    elseif ((Get-Value 'api') -eq 'yes') { Add-Pass "The cluster of lab $lab runs." }
+    else { Add-Warn "The cluster of lab $lab does not answer yet." "In the distribution, run: course start $lab" }
+}
 
 Complete-CheckRun

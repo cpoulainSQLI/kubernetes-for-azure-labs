@@ -7,7 +7,7 @@ metadata:
   namespace: sample-app
   labels:
     app.kubernetes.io/name: sample-app
-    app.kubernetes.io/part-of: aro-k8s-course
+    app.kubernetes.io/part-of: kubernetes-labs
 spec:
   replicas: 5
   selector:
@@ -20,9 +20,8 @@ spec:
     spec:
       containers:
         - name: sample-app
-          image: sample-app:1.0.0
-          # The image only exists inside the kind nodes (kind load), never pull it.
-          imagePullPolicy: IfNotPresent
+          # The nodes pull the image of chapter 1 from the registry of the course.
+          image: localhost:5001/sample-app:1.0.0
           ports:
             - name: http
               containerPort: 8080

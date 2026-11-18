@@ -1,338 +1,142 @@
 <#
 .SYNOPSIS
-The course command for PowerShell: manages the lab environment from your own computer.
+The course command for PowerShell: builds and manages the course's WSL distribution on Windows.
 
 .DESCRIPTION
 Run it from the kit folder:
-  .\course.ps1 up [-Yes] [-Apply]   create the lab environment, or start the lab VM if it exists.
-                                    -Apply also applies a change made to .env. Safe to run twice.
-  .\course.ps1 connect              open an SSH session on the lab VM (type exit to leave)
-  .\course.ps1 status               show the power state, the IP address and the shutdown time
-  .\course.ps1 check                readiness report of the lab environment. Changes nothing.
-  .\course.ps1 stop                 deallocate the lab VM. Your work on it is kept.
-  .\course.ps1 destroy [-Yes]       delete the lab environment and the Terraform state
-  .\course.ps1 update               update the kit here (git pull), and on the lab VM if it runs
-On the lab VM, the bash course command runs the labs: connect, then run course help.
-The bash version, course, does the same on macOS and Linux.
+  .\course.ps1 up [-Yes]        create the WSL distribution of the course with its tools. Safe to run twice.
+  .\course.ps1 connect          open a terminal in the distribution (type exit to leave)
+  .\course.ps1 status           show the distribution, and inside it the tools, the registry and the cluster
+  .\course.ps1 check            readiness report of the environment. Changes nothing.
+  .\course.ps1 stop             stop the distribution. Your work and your cluster are kept.
+  .\course.ps1 destroy [-Yes]   delete the distribution, with everything in it, ~/work included
+  .\course.ps1 update           update the kit here and in the distribution (git pull)
+The labs run inside the distribution: connect, then run course help.
 
 .PARAMETER Command
 up, connect, status, check, stop, destroy, update or help.
 
 .PARAMETER Yes
 Do not ask for confirmation.
-
-.PARAMETER Apply
-With up: run Terraform even when the lab VM exists, to apply a change made to .env.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('up', 'connect', 'ssh-config', 'status','check', 'stop', 'destroy', 'update', 'help', 'start', 'break', 'solution', 'clean')]
+    [ValidateSet('up', 'connect', 'status', 'check', 'stop', 'destroy', 'update', 'help', 'start', 'break', 'solution', 'clean')]
     [string]$Command = 'help',
     [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$Rest,
-    [switch]$Yes,
-    [switch]$Apply
+    [switch]$Yes
 )
 
 . (Join-Path $PSScriptRoot 'lib/lib.ps1')
 $Watch = [System.Diagnostics.Stopwatch]::StartNew()
 
 function Show-Usage {
-    Write-Info 'Usage on your own computer, from the kit folder:'
-    Write-Info '  .\course.ps1 up [-Yes] [-Apply]   create the lab environment, or start the lab VM if it exists.'
-    Write-Info '                                    -Apply also applies a change made to .env. Safe to run twice.'
-    Write-Info '  .\course.ps1 connect              open an SSH session on the lab VM (type exit to leave)'
-    Write-Info '  .\course.ps1 ssh-config           print the SSH settings of the lab VM, for VS Code Remote - SSH'
-    Write-Info '  .\course.ps1 status               show the power state, the IP address and the shutdown time'
-    Write-Info '  .\course.ps1 check                readiness report of the lab environment. Changes nothing.'
-    Write-Info '  .\course.ps1 stop                 deallocate the lab VM. Your work on it is kept.'
-    Write-Info '  .\course.ps1 destroy [-Yes]       delete the lab environment and the Terraform state'
-    Write-Info '  .\course.ps1 update               update the kit here (git pull), and on the lab VM if it runs'
-    Write-Info 'On the lab VM, course start, check, break, solution and clean run the labs: connect, then run course help.'
+    Write-Info 'Usage on Windows, from the kit folder:'
+    Write-Info '  .\course.ps1 up [-Yes]        create the WSL distribution of the course with its tools. Safe to run twice.'
+    Write-Info '  .\course.ps1 connect          open a terminal in the distribution (type exit to leave)'
+    Write-Info '  .\course.ps1 status           show the distribution, and inside it the tools, the registry and the cluster'
+    Write-Info '  .\course.ps1 check            readiness report of the environment. Changes nothing.'
+    Write-Info '  .\course.ps1 stop             stop the distribution. Your work and your cluster are kept.'
+    Write-Info '  .\course.ps1 destroy [-Yes]   delete the distribution, with everything in it, ~/work included'
+    Write-Info '  .\course.ps1 update           update the kit here and in the distribution (git pull)'
+    Write-Info 'The labs run inside the distribution: .\course.ps1 connect, then course start 01. Run course help there.'
 }
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-function Initialize-Laptop {
-    Read-CourseSetting
-    Assert-Command 'az' 'Install the Azure CLI: https://learn.microsoft.com/cli/azure/install-azure-cli'
-    Assert-AzSignedIn
-    Assert-ExpectedSubscription
-}
-
-# Brings the clone of the kit up to date with git pull.
-function Invoke-KitUpdate {
-    Assert-Command 'git' 'Install Git: https://git-scm.com/downloads'
-    if ((Invoke-Native -FilePath 'git' -Arguments @('-C', $CourseRoot, 'rev-parse', '--git-dir')).ExitCode -ne 0) {
-        Exit-WithError "$CourseRoot is not a Git clone, so it cannot be updated. Clone the kit with Git."
+function Assert-Wsl {
+    Assert-Command 'wsl.exe' 'Install WSL from an administrator PowerShell with: wsl --install, then restart Windows.'
+    if ((Invoke-Wsl @('--status')).ExitCode -ne 0) {
+        Exit-WithError 'WSL does not answer. Install it from an administrator PowerShell with: wsl --install, then restart Windows and run .\course.ps1 up again.'
     }
-    Write-Step "Updating the kit in $CourseRoot"
-    & git -C $CourseRoot pull --ff-only
-    if ($LASTEXITCODE -ne 0) { Exit-WithError "git pull failed. If you changed files of the kit, list them with: git -C `"$CourseRoot`" status" }
+}
+
+function Assert-Distro {
+    Assert-Wsl
+    if (-not (Get-DistroState)) { Exit-WithError "The WSL distribution $DistroName does not exist. Create it with: .\course.ps1 up" }
 }
 
 # ---------------------------------------------------------------------------
 # up
 # ---------------------------------------------------------------------------
 
-# Does with the state container what Terraform does with its state: writes a blob, then locks it with a lease.
-# The blob access-check stays in the container, so later runs only take and release the lease and add no blob version.
-function Test-StateAccess([string]$Account) {
-    $blob = 'access-check'
-    $where = @('--account-name', $Account, '--container-name', $StateContainer, '--auth-mode', 'login')
-    $exists = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'exists', '--name', $blob, '--query', 'exists', '--output', 'tsv') + $where)
-    if ($exists.ExitCode -ne 0) { return $false }
-    if ($exists.Output -ne 'true') {
-        $upload = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'upload', '--name', $blob, '--data', 'course up access check',
-                '--only-show-errors', '--output', 'none') + $where)
-        if ($upload.ExitCode -ne 0) { return $false }
-    }
-    $lease = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'lease', 'acquire', '--blob-name', $blob, '--lease-duration', '15', '--output', 'tsv') + $where)
-    if ($lease.ExitCode -ne 0 -or -not $lease.Output) { return $false }
-    $release = Invoke-Native -FilePath 'az' -Arguments (@('storage', 'blob', 'lease', 'release', '--blob-name', $blob, '--lease-id', $lease.Output, '--output', 'none') + $where)
-    return ($release.ExitCode -eq 0)
-}
-
-# Creates or updates the lab environment with Terraform: the state storage first, then the configuration in setup/infra.
-function Invoke-UpWithTerraform([string]$SshPublicKey, [string]$KitUrl, [bool]$AssumeYes) {
-    Assert-Terraform
-
-    # step: subscription
-    Write-Step 'Subscription'
-    $account = Get-AzJson @('account', 'show')
-    $subId = Get-Prop $account 'id'
-    $subscription = Get-AzJson @('rest', '--method', 'get', '--url', "https://management.azure.com/subscriptions/${subId}?api-version=2022-12-01")
-    $spendingLimit = Get-Prop $subscription 'subscriptionPolicies.spendingLimit'
-    if (-not $spendingLimit) { $spendingLimit = 'unknown' }
-    Write-Info "Subscription: $(Get-Prop $account 'name') ($(Get-Prop $account 'state')), spending limit: $spendingLimit"
-    if ((Get-Prop $account 'state') -ne 'Enabled') {
-        Exit-WithError "The subscription is $(Get-Prop $account 'state'). Wait for the next billing period or pick another subscription."
-    }
-    if ($spendingLimit -eq 'Off') {
-        Write-Info 'Warning: the spending limit is off, so nothing stops charges at the credit amount. The budget alerts still work.'
-    }
-
-    # step: region
-    Write-Step 'Checking the region, the VM size and the image'
-    $skus = @(Get-AzJson @('vm', 'list-skus', '--location', $Config.REGION, '--size', $Config.VM_SIZE, '--resource-type', 'virtualMachines'))
-    $sku = $skus | Where-Object { $null -ne $_ -and $_.name -eq $Config.VM_SIZE } | Select-Object -First 1
-    if (-not $sku) { Exit-WithError "$($Config.VM_SIZE) is not offered in $($Config.REGION). Pick another REGION or VM_SIZE in .env." }
-    $restrictions = @(Get-Prop $sku 'restrictions') | Where-Object { $null -ne $_ }
-    if (@($restrictions).Count -gt 0) {
-        Exit-WithError "$($Config.VM_SIZE) is restricted for this subscription in $($Config.REGION) ($((@($restrictions) | ForEach-Object { $_.reasonCode }) -join ', ')). Pick another REGION or VM_SIZE in .env."
-    }
-    if ((Invoke-Native -FilePath 'az' -Arguments @('vm', 'image', 'show', '--urn', $Config.VM_IMAGE, '--location', $Config.REGION, '--output', 'none')).ExitCode -ne 0) {
-        Exit-WithError "The image $($Config.VM_IMAGE) is not available in $($Config.REGION). List the options with: az vm image list --publisher Canonical --offer ubuntu-26_04-lts --location $($Config.REGION) --all --output table"
-    }
-    if ($Config.VM_IMAGE.Split(':').Count -ne 4) { Exit-WithError 'VM_IMAGE must have the form publisher:offer:sku:version.' }
-    Write-Info "OK: $($Config.VM_SIZE) and $($Config.VM_IMAGE) are available in $($Config.REGION)."
-
-    # step: cost
-    Write-Step "Estimated cost (Azure Retail Prices API, $($Config.CURRENCY), pay-as-you-go)"
-    $vmHour = Get-PriceVmHour
-    $diskMonth = Get-PriceDiskMonth
-    $ipHour = Get-PricePublicIpHour
-    Write-Info "Lab VM $($Config.VM_SIZE): $vmHour per hour, only while it runs."
-    Write-Info "OS disk $($Config.OS_DISK_GB) GiB Standard SSD: $diskMonth per month, even while the VM is stopped."
-    Write-Info "Public IPv4 address: $ipHour per hour, even while the VM is stopped."
-    Write-Info "Terraform state storage: $(Get-PriceBlobGbMonth) per GB per month. The state takes a few kilobytes."
-    if ($vmHour -ne 'n/a' -and $diskMonth -ne 'n/a' -and $ipHour -ne 'n/a') {
-        $vmPrice = [double]::Parse($vmHour, $Invariant)
-        $disk = [double]::Parse($diskMonth, $Invariant)
-        $ip = [double]::Parse($ipHour, $Invariant)
-        Write-Info "About $(Format-Number ($vmPrice * 60 + $disk + $ip * 730)) $($Config.CURRENCY) per month if the VM runs 2 hours a day (60 hours)."
-        Write-Info "About $(Format-Number ($disk / 30.4 + $ip * 24)) $($Config.CURRENCY) per day while the VM is stopped (disk and IP address)."
-    }
-    Write-Info "Budget: $($Config.BUDGET_AMOUNT) $($Config.CURRENCY) per month for the whole subscription, with alerts."
-
-    # step: confirm
-    if (-not (Confirm-Action "Create or update the lab environment in $($Config.REGION)?" $AssumeYes)) {
-        Write-Info 'Nothing changed.'
-        exit 0
-    }
-
-    # step: providers
-    Write-Step 'Registering the resource providers used by the course'
-    $namespaces = @('Microsoft.Compute', 'Microsoft.Network', 'Microsoft.Storage', 'Microsoft.DevTestLab',
-        'Microsoft.ContainerRegistry', 'Microsoft.Consumption', 'Microsoft.ContainerService', 'Microsoft.RedHatOpenShift',
-        'Microsoft.ManagedIdentity', 'Microsoft.OperationalInsights')
-    foreach ($namespace in $namespaces) {
-        $state = Get-AzValue @('provider', 'show', '--namespace', $namespace, '--query', 'registrationState')
-        if ($state -eq 'Registered') {
-            Write-Info "${namespace}: already registered"
-        }
-        else {
-            Write-Info "${namespace}: registering (this can take a few minutes)"
-            Invoke-AzChange @('provider', 'register', '--namespace', $namespace, '--wait') "Registering $namespace"
-        }
-    }
-
-    # step: state
-    Write-Step 'Storage for the Terraform state'
-    $stateRg = Get-StateRgName
-    $stateAccount = Get-StateAccountName $subId
-    Invoke-AzChange @('group', 'create', '--tags', "$CourseTagKey=$CourseTagValue", "chapter=$SetupChapter", '--name', $stateRg, '--location', $Config.REGION) 'Creating the state resource group'
-    if ((Invoke-Native -FilePath 'az' -Arguments @('storage', 'account', 'show', '--resource-group', $stateRg, '--name', $stateAccount, '--output', 'none')).ExitCode -eq 0) {
-        Write-Info "Storage account $stateAccount already exists."
-    }
-    else {
-        Write-Info "Creating storage account $stateAccount in $stateRg. Access needs Microsoft Entra ID, never an account key."
-        Invoke-AzChange @('storage', 'account', 'create', '--tags', "$CourseTagKey=$CourseTagValue", "chapter=$SetupChapter",
-            '--resource-group', $stateRg, '--name', $stateAccount, '--location', $Config.REGION,
-            '--sku', 'Standard_LRS', '--kind', 'StorageV2', '--min-tls-version', 'TLS1_2', '--https-only', 'true',
-            '--allow-blob-public-access', 'false', '--allow-shared-key-access', 'false') 'Creating the state storage account'
-    }
-    # Blob versioning keeps the earlier versions of the state, so a damaged state can be restored.
-    Invoke-AzChange @('storage', 'account', 'blob-service-properties', 'update', '--resource-group', $stateRg, '--account-name', $stateAccount,
-        '--enable-versioning', 'true') 'Turning on blob versioning'
-    $containerExists = Get-AzValue @('storage', 'container-rm', 'exists', '--resource-group', $stateRg, '--storage-account', $stateAccount, '--name', $StateContainer, '--query', 'exists')
-    if ($containerExists -ne 'true') {
-        Invoke-AzChange @('storage', 'container-rm', 'create', '--resource-group', $stateRg, '--storage-account', $stateAccount, '--name', $StateContainer) 'Creating the state container'
-    }
-    $accountId = Get-AzValue @('storage', 'account', 'show', '--resource-group', $stateRg, '--name', $stateAccount, '--query', 'id')
-    $userId = Get-AzValue @('ad', 'signed-in-user', 'show', '--query', 'id')
-    if (-not $accountId -or -not $userId) { Exit-WithError 'Could not read the state storage account or your account in Microsoft Entra ID. Run az login, then .\course.ps1 up again.' }
-    # az is a batch file on Windows, and cmd.exe rejects a query such as length(@), so the script lists the IDs and
-    # counts them. A failed lookup stops the script here, instead of skipping the grant and waiting 10 minutes for nothing.
-    $roleCheck = Invoke-Native -FilePath 'az' -Arguments @('role', 'assignment', 'list', '--assignee', $userId, '--scope', $accountId,
-        '--role', 'Storage Blob Data Contributor', '--query', '[].id', '--output', 'tsv', '--only-show-errors')
-    if ($roleCheck.ExitCode -ne 0) { Exit-WithError 'Could not read the role assignments of the state storage account. Run az login, then .\course.ps1 up again.' }
-    # A new role reaches the storage servers one by one, so one good test proves little. After a grant, the test
-    # has to pass three times in a row before Terraform runs.
-    $needed = 1
-    if (-not $roleCheck.Output) {
-        Write-Info "Giving your account the Storage Blob Data Contributor role on $stateAccount."
-        Invoke-AzChange @('role', 'assignment', 'create', '--assignee-object-id', $userId, '--assignee-principal-type', 'User',
-            '--role', 'Storage Blob Data Contributor', '--scope', $accountId) 'Giving your account access to the state'
-        $needed = 3
-    }
-    Write-Info 'Waiting until your account can write to the state container (a new role can take up to 10 minutes to apply).'
-    $deadline = (Get-Date).AddMinutes(10)
-    $passes = 0
-    while ($passes -lt $needed -and (Get-Date) -lt $deadline) {
-        if (Test-StateAccess $stateAccount) { $passes++ } else { $passes = 0 }
-        if ($passes -lt $needed) { Start-Sleep -Seconds 10 }
-    }
-    if ($passes -lt $needed) { Exit-WithError 'Your account still cannot write to the state container after 10 minutes. Wait a few minutes and run .\course.ps1 up again.' }
-    Write-Info "OK: the state of the setup goes to $stateAccount/$StateContainer/$SetupFolder.tfstate."
-
-    # step: plan
-    Write-Step 'Planning the lab environment with Terraform'
-    $contactEmail = $Config.BUDGET_CONTACT_EMAIL
-    if (-not $contactEmail) { $contactEmail = Get-Prop $account 'user.name' }
-    if ("$contactEmail" -notmatch '@') { Exit-WithError 'No e-mail address for budget alerts. Set BUDGET_CONTACT_EMAIL in .env.' }
-    $infraDir = Join-Path (Join-Path $CourseRoot 'setup') 'infra'
-    Initialize-TerraformEnvironment $SetupFolder $subId
-    # Values go through TF_VAR_ environment variables, never through JSON on a command line.
-    Export-SetupTerraformVariable $stateAccount $contactEmail $SshPublicKey $KitUrl
-    $planFile = Join-Path $env:TF_DATA_DIR 'lab.tfplan'
-    if ((Invoke-Terraform $infraDir (Get-TerraformInitArgument $stateAccount "$SetupFolder.tfstate")) -ne 0) {
-        Exit-WithError ('terraform init failed. If the message above shows a 403 error, your role on the state storage is not active everywhere yet. ' +
-            'Wait 10 minutes and run .\course.ps1 up again. Otherwise fix the cause shown above and run .\course.ps1 up again.')
-    }
-    if ((Invoke-Terraform $infraDir @('plan', "-out=$planFile")) -ne 0) {
-        Exit-WithError 'terraform plan failed. Read the message above, fix the cause and run .\course.ps1 up again.'
-    }
-
-    # step: apply
-    if (-not (Confirm-Action 'Apply this plan?' $AssumeYes)) {
-        Clear-TerraformEnvironment
-        Write-Info 'The lab environment is unchanged. The state storage stays for the next run.'
-        exit 0
-    }
-    Write-Step 'Applying the plan (about 3 minutes)'
-    $applyCode = Invoke-Terraform $infraDir @('apply', $planFile)
-    Remove-Item -LiteralPath $planFile -Force -ErrorAction SilentlyContinue
-    Clear-TerraformEnvironment
-    if ($applyCode -ne 0) { Exit-WithError 'terraform apply failed. Read the message above, fix the cause and run .\course.ps1 up again.' }
-    Write-Info 'Terraform finished.'
-}
-
-function Invoke-Up([bool]$AssumeYes, [bool]$ApplyChanges) {
+function Invoke-Up([bool]$AssumeYes) {
     # step: preflight
-    Initialize-Laptop
-    Assert-Command 'ssh' 'Install the OpenSSH client.'
-    Assert-Command 'scp' 'Install the OpenSSH client.'
-    if (-not $Config.LEARNER_IP) { Exit-WithError 'Set LEARNER_IP in .env to your public IPv4 address.' }
-    if ($Config.LEARNER_IP -notmatch '^([0-9]{1,3}\.){3}[0-9]{1,3}$') { Exit-WithError 'LEARNER_IP must be a plain IPv4 address, without /32.' }
-    $keyFile = Get-SshKeyFile
-    if (-not (Test-Path -LiteralPath $keyFile) -or -not (Test-Path -LiteralPath "$keyFile.pub")) {
-        Exit-WithError "No SSH key pair at $($Config.SSH_KEY_PATH). Create it with: ssh-keygen -t ed25519 -f `"$keyFile`" -C aro-k8s-lab"
-    }
-    $sshPublicKey = (Get-Content -LiteralPath "$keyFile.pub" -Raw).Trim()
-    if (-not ($sshPublicKey.StartsWith('ssh-ed25519') -or $sshPublicKey.StartsWith('ssh-rsa'))) {
-        Exit-WithError "$($Config.SSH_KEY_PATH).pub is not an Ed25519 or RSA public key."
-    }
-
-    # step: kit-url
+    Assert-Wsl
+    Assert-Command 'git' 'Install Git: https://git-scm.com/downloads'
+    Read-CourseSetting
     $kitUrl = Get-KitRepoUrl
     if (-not $kitUrl) {
-        Exit-WithError 'Could not work out where the lab VM clones the kit from. Clone the kit with Git, or set KIT_REPO in .env to its HTTPS URL.'
+        Exit-WithError 'Could not work out where the distribution clones the kit from. Clone the kit with Git, or set KIT_REPO in .env to its HTTPS URL.'
     }
-    Write-Info "The lab VM clones the kit from $kitUrl"
 
-    # step: existing
-    $rg = Get-RgName
-    $vm = Get-VmName
-    $vmExisted = (Invoke-Native -FilePath 'az' -Arguments @('vm', 'show', '--resource-group', $rg, '--name', $vm, '--output', 'none')).ExitCode -eq 0
-    $nsgSource = Get-AzValue @('network', 'nsg', 'rule', 'show', '--resource-group', $rg, '--nsg-name', "$vm-nsg", '--name', 'allow-ssh-from-learner', '--query', 'sourceAddressPrefix')
-    if ($vmExisted -and $nsgSource -eq "$($Config.LEARNER_IP)/32" -and -not $ApplyChanges) {
-        Write-Info 'The lab environment exists. To apply a change made to .env, run: .\course.ps1 up -Apply'
+    # step: tools
+    Write-Step "The WSL distribution $DistroName"
+    if (Get-DistroState) {
+        Write-Info "The distribution $DistroName exists."
     }
     else {
-        if ($vmExisted -and $nsgSource -ne "$($Config.LEARNER_IP)/32") {
-            $shown = $nsgSource
-            if (-not $shown) { $shown = 'no address' }
-            Write-Info "The lab VM accepts SSH from $shown, and LEARNER_IP in .env is $($Config.LEARNER_IP). Terraform updates the rule."
+        $userData = Get-UserDataPath
+        Write-Info "This creates a WSL distribution named $DistroName from $($Config.WSL_SOURCE), kept for the course. At its first start, cloud-init:"
+        Write-Info "  - creates the Linux user $LinuxUser, with sudo and no password,"
+        Write-Info "  - installs Docker Engine, kubectl $PinnedKubectlMinor, kind $PinnedKindVersion, git, curl, jq and python3-yaml (setup/install-tools.sh),"
+        Write-Info "  - clones the kit from $kitUrl into ~/$KitName and puts the course command on its PATH."
+        Write-Info "It writes the instructions for cloud-init to $userData."
+        Write-Info 'It takes a few minutes and about 8 GB of disk. Nothing changes on Windows itself, and Docker Desktop is not needed.'
+        if (-not (Confirm-Action "Create the distribution ${DistroName}?" $AssumeYes)) {
+            Write-Info 'Nothing changed.'
+            exit 0
         }
-        Invoke-UpWithTerraform -SshPublicKey $sshPublicKey -KitUrl $kitUrl -AssumeYes $AssumeYes
+        $written = Write-UserData $kitUrl
+        Write-Info "Wrote $written."
+        Write-Step "Creating the distribution (about a minute)"
+        $env:WSL_UTF8 = '1'
+        & wsl.exe --install $Config.WSL_SOURCE --name $DistroName --no-launch | Out-Host
+        if ($LASTEXITCODE -ne 0 -or -not (Get-DistroState)) {
+            Exit-WithError "wsl --install did not create $DistroName. Read the message above. If WSL itself is missing, run wsl --install in an administrator PowerShell, restart Windows, then run .\course.ps1 up again."
+        }
+        Write-Step 'Installing the tools with cloud-init (2 to 5 minutes)'
+        Invoke-InDistro -Root -Command 'cloud-init status --wait >/dev/null 2>&1 || true' | Out-Null
+        # WSL applies the default user of /etc/wsl.conf from the next start, so the distribution restarts once.
+        Invoke-Wsl @('--terminate', $DistroName) | Out-Null
+    }
+    $ready = Invoke-InDistro -Root -Capture -Command "cat /etc/$KitName/tools-ready"
+    if ($ready.ExitCode -ne 0) {
+        Exit-WithError ("The installation in $DistroName did not finish. Read its log with: wsl -d $DistroName -u root -- tail -n 50 /var/log/$KitName-install.log. " +
+            "To start again from scratch: .\course.ps1 destroy, then .\course.ps1 up")
+    }
+    Write-Info $ready.Output
+
+    # step: docker-access
+    $user = Invoke-InDistro -Capture -Command 'id -un'
+    if ($user.Output -ne $LinuxUser) {
+        Exit-WithError "The distribution logs in as '$($user.Output)', not as $LinuxUser. Stop it with .\course.ps1 stop, then run .\course.ps1 up again."
+    }
+    if ((Invoke-InDistro -Capture -Command 'docker info').ExitCode -ne 0) {
+        Exit-WithError "Docker Engine does not answer in $DistroName. Stop the distribution with .\course.ps1 stop, then run .\course.ps1 up again."
     }
 
-    # step: start-vm
-    $powerState = Get-PowerState
-    if ($powerState -ne 'PowerState/running') {
-        Write-Info "The lab VM is $($powerState -replace 'PowerState/', ''). Starting it (about a minute)."
-        Invoke-AzChange @('vm', 'start', '--resource-group', $rg, '--name', $vm) 'Starting the lab VM'
-    }
-    $vmIp = Get-VmPublicIp
-    if (-not $vmExisted) {
-        # A new VM can reuse an old IP address with a new host key: forget the old key.
-        $knownHosts = Join-Path (Join-Path $HOME '.ssh') 'aro-k8s_known_hosts'
-        if (Test-Path -LiteralPath $knownHosts) { Invoke-Native -FilePath 'ssh-keygen' -Arguments @('-R', $vmIp, '-f', $knownHosts) | Out-Null }
+    # step: registry
+    Write-Step 'Registry'
+    if ((Invoke-InDistro -Command "source ~/$KitName/lib/lib.sh && ensure_registry") -ne 0) {
+        Exit-WithError 'The registry could not be created. Read the message above, then run .\course.ps1 up again.'
     }
 
-    # step: wait-ssh
-    Write-Step "Waiting for SSH on $vmIp"
-    $ready = $false
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-        if (Test-TcpPort $vmIp 22) { $ready = $true; break }
-        Start-Sleep -Seconds 10
+    # step: launcher
+    if ((Invoke-InDistro -Capture -Command "command -v course && test -d ~/$KitName/.git && test -d ~/work").ExitCode -ne 0) {
+        Exit-WithError "The kit, the course command or ~/work is missing in $DistroName. Read the log with: wsl -d $DistroName -u root -- tail -n 50 /var/log/$KitName-install.log"
     }
-    if (-not $ready) {
-        Exit-WithError 'SSH did not answer after 5 minutes. Check that LEARNER_IP in .env is still your public IP, then run: .\course.ps1 up'
-    }
-
-    # step: wait-cloud-init
-    Write-Step 'Waiting for cloud-init to install the tools (5 to 10 minutes on the first run)'
-    if ((Invoke-LabSsh 'cloud-init status --wait > /dev/null 2>&1; test -f /etc/aro-k8s/tools-ready') -ne 0) {
-        Exit-WithError 'The tool installation did not finish. Connect with .\course.ps1 connect, then read the log: sudo tail -n 50 /var/log/aro-k8s-install.log'
-    }
-    Invoke-LabSsh 'cat /etc/aro-k8s/tools-ready' | Out-Null
-
-    # step: kit-on-vm
-    Write-Step 'The kit on the lab VM'
-    Install-KitOnVm $kitUrl
+    Write-Info "The kit is cloned in ~/$KitName, the course command is on the PATH, and your work goes in ~/work."
 
     # step: done
     Write-Step 'Done'
-    Write-Info ('This run took {0} min.' -f [int][math]::Round($Watch.Elapsed.TotalMinutes))
-    Write-Info "Lab VM: $vm in $rg, at $vmIp, reachable from $($Config.LEARNER_IP) only."
-    Write-Info "It shuts down every day at $($Config.AUTO_SHUTDOWN_TIME) ($($Config.AUTO_SHUTDOWN_TIMEZONE)). Stop it yourself when you finish: .\course.ps1 stop"
-    Write-Info 'Next: the readiness report, then a session on the lab VM.'
+    Write-Info ('This run took {0} s.' -f [int]$Watch.Elapsed.TotalSeconds)
+    $versions = Invoke-InDistro -Capture -Command "source ~/$KitName/lib/lib.sh && echo Docker Engine `$(docker_version), kind `$(kind_version), kubectl `$(kubectl_version)"
+    Write-Info $versions.Output
+    Write-Info 'Closing the last terminal of the distribution stops it after a few seconds. Your work and your cluster are kept,'
+    Write-Info 'and course start NN brings a lab back. Next: the readiness report, then a terminal in the distribution.'
     Write-Info '  .\course.ps1 check'
     Write-Info '  .\course.ps1 connect'
+    Write-Info '  course start 01      (in the distribution)'
 }
 
 # ---------------------------------------------------------------------------
@@ -341,192 +145,89 @@ function Invoke-Up([bool]$AssumeYes, [bool]$ApplyChanges) {
 
 function Invoke-Connect {
     # step: cmd-connect
-    Initialize-Laptop
-    Assert-Command 'ssh' 'Install the OpenSSH client.'
-    if ((Get-PowerState) -ne 'PowerState/running') { Exit-WithError 'The lab VM is not running. Start it with: .\course.ps1 up' }
-    Enter-LabSsh
-}
-
-# Prints a Host block for ~/.ssh/config, so that VS Code Remote - SSH (or plain ssh) reaches the lab VM with the
-# same key, user and known hosts file as course connect. Every line is valid in ~/.ssh/config, comments included.
-# The lines go to the output stream, so .\course.ps1 ssh-config | Set-Clipboard copies them.
-function Invoke-SshConfig {
-    # step: cmd-ssh-config
-    Initialize-Laptop
-    $ip = Get-VmPublicIp
-    if (-not $ip) { Exit-WithError 'No public IP found for the lab VM. Create it first with: .\course.ps1 up' }
-    # OpenSSH on Windows reads forward slashes, and ~ stands for the user profile.
-    $key = "$($Config.SSH_KEY_PATH)" -replace '\\', '/'
-    if ($key.Contains(' ')) { $key = "`"$key`"" }
-    $vm = Get-VmName
-    Write-Output '# Lab VM of the course. Paste these lines into ~/.ssh/config, then in VS Code run'
-    Write-Output "# `"Remote-SSH: Connect to Host...`" and pick $vm. The IP address changes only after course destroy."
-    if ((Get-PowerState) -ne 'PowerState/running') {
-        Write-Output '# The lab VM is not running. Start it with .\course.ps1 up before you connect.'
-    }
-    Write-Output "Host $vm"
-    Write-Output "    HostName $ip"
-    Write-Output "    User $($Config.ADMIN_USERNAME)"
-    Write-Output "    IdentityFile $key"
-    Write-Output '    UserKnownHostsFile ~/.ssh/aro-k8s_known_hosts'
+    Assert-Distro
+    $env:WSL_UTF8 = '1'
+    & wsl.exe -d $DistroName --cd '~'
 }
 
 function Invoke-Status {
     # step: cmd-status
-    Initialize-Laptop
-    $state = Get-PowerState
-    if (-not $state) { $state = 'not found' }
-    Write-Info "Lab VM: $(Get-VmName) in $(Get-RgName)"
-    Write-Info "Power state: $state"
-    Write-Info "Public IP: $(Get-VmPublicIp)"
-    Write-Info "Auto-shutdown: $($Config.AUTO_SHUTDOWN_TIME) ($($Config.AUTO_SHUTDOWN_TIMEZONE))"
+    Assert-Wsl
+    $state = Get-DistroState
+    if (-not $state) {
+        Write-Info "The WSL distribution $DistroName does not exist. Create it with: .\course.ps1 up"
+        return
+    }
+    Write-Info "WSL distribution $DistroName`: $state"
+    if ($state -ne 'Running') {
+        Write-Info 'It starts with .\course.ps1 connect. Then course start NN brings your lab back.'
+        return
+    }
+    Invoke-InDistro -Command 'course status' | Out-Null
 }
 
 function Invoke-Stop {
     # step: stop
-    Initialize-Laptop
-    Write-Step 'Stopping (deallocating) the lab VM'
-    $powerState = Get-PowerState
-    if (-not $powerState) {
-        Write-Info 'No lab VM found. Nothing to stop.'
-    }
-    elseif ($powerState -eq 'PowerState/deallocated') {
-        Write-Info 'The lab VM is already deallocated.'
-    }
-    else {
-        Invoke-AzChange @('vm', 'deallocate', '--resource-group', (Get-RgName), '--name', (Get-VmName)) 'Deallocating the lab VM'
-        Write-Info 'The lab VM is deallocated. Compute charges have stopped.'
-    }
-    Write-Info "Still charged while stopped: the OS disk ($(Get-PriceDiskMonth) $($Config.CURRENCY) per month) and the public IP address ($(Get-PricePublicIpHour) $($Config.CURRENCY) per hour)."
-    Write-Info 'Start the VM again with: .\course.ps1 up'
-    # step: list
-    Show-CourseResource
+    Assert-Wsl
+    $state = Get-DistroState
+    if (-not $state) { Write-Info "The WSL distribution $DistroName does not exist. Nothing to stop."; return }
+    if ($state -ne 'Running') { Write-Info "The WSL distribution $DistroName is already $state."; return }
+    Invoke-Wsl @('--terminate', $DistroName) | Out-Null
+    Write-Info "Stopped $DistroName. Your work in ~/work, the registry and your cluster are kept."
+    Write-Info 'Next time: .\course.ps1 connect, then course start NN brings your lab back.'
 }
 
 # ---------------------------------------------------------------------------
-# destroy
+# destroy and update
 # ---------------------------------------------------------------------------
 
 function Invoke-Destroy([bool]$AssumeYes) {
-    Initialize-Laptop
-    $rg = Get-RgName
-    $stateRg = Get-StateRgName
-
     # step: destroy-confirm
-    Write-Step 'Destroying the lab environment'
-    Write-Info "This deletes resource group $rg with everything in it, budget $(Get-BudgetName),"
-    Write-Info "and resource group $stateRg with the Terraform state of the setup and of every lab."
-    Write-Info 'Your work on the lab VM is lost. Copy anything you want to keep first.'
+    Assert-Wsl
+    if (-not (Get-DistroState)) {
+        Write-Info "The WSL distribution $DistroName does not exist. Nothing to delete."
+        return
+    }
+    Write-Step "Deleting the WSL distribution $DistroName"
+    Write-Info 'This deletes the distribution with everything in it: your work in ~/work goes with it,'
+    Write-Info 'and so do the cluster, the registry with the images you pushed, and the clone of the kit.'
+    Write-Info 'Copy what you want to keep first, for example to \\wsl.localhost\kubernetes-labs\home\learner\work from Windows.'
     if (-not $AssumeYes) {
-        $typed = Read-Host "Type the prefix '$($Config.PREFIX)' to confirm"
-        if ($typed -cne $Config.PREFIX) {
+        $typed = Read-Host "Type the name '$DistroName' to confirm"
+        if ($typed -cne $DistroName) {
             Write-Info 'Nothing deleted.'
             exit 0
         }
     }
-
-    # step: destroy-terraform
-    Write-Step 'Destroying the lab with Terraform'
-    $subId = Get-AzValue @('account', 'show', '--query', 'id')
-    $stateAccount = Get-StateAccountName $subId
-    $infraDir = Join-Path (Join-Path $CourseRoot 'setup') 'infra'
-    if (-not (Test-Command 'terraform')) {
-        Write-Info 'Terraform is not installed. The steps below delete the lab with the Azure CLI.'
-    }
-    elseif ((Invoke-Native -FilePath 'az' -Arguments @('storage', 'account', 'show', '--resource-group', $stateRg, '--name', $stateAccount, '--output', 'none')).ExitCode -ne 0) {
-        Write-Info 'No Terraform state storage found. The steps below delete the lab with the Azure CLI.'
-    }
-    else {
-        # terraform destroy needs a value for every variable, even those it does not use.
-        $contactEmail = $Config.BUDGET_CONTACT_EMAIL
-        if (-not $contactEmail) { $contactEmail = Get-AzValue @('account', 'show', '--query', 'user.name') }
-        $sshPublicKey = 'not-needed-to-destroy'
-        $keyFile = "$(Get-SshKeyFile).pub"
-        if (Test-Path -LiteralPath $keyFile) { $sshPublicKey = (Get-Content -LiteralPath $keyFile -Raw).Trim() }
-        $kitUrl = Get-KitRepoUrl
-        if (-not $kitUrl) { $kitUrl = 'https://example.invalid/not-needed-to-destroy' }
-        Initialize-TerraformEnvironment $SetupFolder $subId
-        Export-SetupTerraformVariable $stateAccount $contactEmail $sshPublicKey $kitUrl
-        $destroyed = ((Invoke-Terraform $infraDir (Get-TerraformInitArgument $stateAccount "$SetupFolder.tfstate")) -eq 0) -and
-            ((Invoke-Terraform $infraDir @('destroy', '-auto-approve')) -eq 0)
-        Clear-TerraformEnvironment
-        if ($destroyed) { Write-Info 'Terraform destroyed the lab environment.' }
-        else { Write-Info 'Terraform could not destroy everything. The steps below delete what is left with the Azure CLI.' }
-    }
-
-    # step: destroy-rg
-    if ((Invoke-Native -FilePath 'az' -Arguments @('group', 'show', '--name', $rg, '--output', 'none')).ExitCode -eq 0) {
-        Write-Info "Deleting resource group $rg (5 to 10 minutes)."
-        Invoke-AzChange @('group', 'delete', '--name', $rg, '--yes') 'Deleting the resource group'
-        Write-Info 'Resource group deleted.'
-    }
-    else {
-        Write-Info "Resource group $rg does not exist."
-    }
-
-    # step: destroy-budget
-    $budgetUrl = Get-BudgetUrl $subId
-    if (Get-AzJson @('rest', '--method', 'get', '--url', $budgetUrl)) {
-        Invoke-AzChange @('rest', '--method', 'delete', '--url', $budgetUrl) 'Deleting the budget'
-        Write-Info "Budget $(Get-BudgetName) deleted."
-    }
-    else {
-        Write-Info "Budget $(Get-BudgetName) does not exist."
-    }
-
-    # step: destroy-state
-    if ((Invoke-Native -FilePath 'az' -Arguments @('group', 'show', '--name', $stateRg, '--output', 'none')).ExitCode -eq 0) {
-        Write-Info "Deleting resource group $stateRg with the Terraform state (a few minutes)."
-        Invoke-AzChange @('group', 'delete', '--name', $stateRg, '--yes') 'Deleting the state resource group'
-        Write-Info 'Resource group deleted.'
-    }
-    else {
-        Write-Info "Resource group $stateRg does not exist."
-    }
-    Remove-Item -LiteralPath (Join-Path (Join-Path (Join-Path $HOME '.aro-k8s') 'terraform') $SetupFolder) -Recurse -Force -ErrorAction SilentlyContinue
-
-    # step: destroy-known-hosts
-    Remove-Item -LiteralPath (Join-Path (Join-Path $HOME '.ssh') 'aro-k8s_known_hosts') -Force -ErrorAction SilentlyContinue
-    Write-Info 'Azure may have created a resource group named NetworkWatcherRG when the network was created. It costs nothing on its own and you can keep it.'
-
-    # step: list
-    Show-CourseResource
+    # step: destroy
+    $result = Invoke-Wsl @('--unregister', $DistroName)
+    if ($result.ExitCode -ne 0) { Exit-WithError "wsl --unregister $DistroName failed: $($result.Output)" }
+    Remove-Item -LiteralPath (Get-UserDataPath) -Force -ErrorAction SilentlyContinue
+    Write-Info "Deleted $DistroName and its cloud-init file. .\course.ps1 up creates it again."
 }
-
-# ---------------------------------------------------------------------------
-# update
-# ---------------------------------------------------------------------------
 
 function Invoke-Update {
     # step: update-kit
-    Invoke-KitUpdate
-    # step: update-vm
-    Read-CourseSetting
-    if (-not (Test-Command 'az') -or -not (Test-AzSignedIn)) {
-        Write-Info 'The Azure CLI is not signed in here, so the kit on the lab VM was not updated. On the lab VM, run: course update'
-        return
+    Assert-Command 'git' 'Install Git: https://git-scm.com/downloads'
+    Write-Step "Updating the kit in $CourseRoot"
+    & git -C $CourseRoot pull --ff-only
+    if ($LASTEXITCODE -ne 0) { Exit-WithError "git pull failed. If you changed files of the kit, list them with: git -C `"$CourseRoot`" status" }
+    if ((Get-DistroState) -eq 'Running') {
+        if ((Invoke-InDistro -Command 'course update') -ne 0) { Exit-WithError "The update failed in $DistroName. Read the message above." }
     }
-    Assert-ExpectedSubscription
-    if ((Get-PowerState) -ne 'PowerState/running') {
-        Write-Info 'The lab VM is not running. Once it runs, update its kit from here with .\course.ps1 update, or on the lab VM with: course update'
-        return
+    else {
+        Write-Info "The kit in $DistroName updates when it runs: .\course.ps1 connect, then course update."
     }
-    Write-Step 'Updating the kit on the lab VM'
-    if ((Invoke-LabSsh "git -C ~/$VmCourseDir pull --ff-only") -ne 0) {
-        Exit-WithError "git pull failed on the lab VM. Connect with .\course.ps1 connect and look at: git -C ~/$VmCourseDir status"
-    }
-    Copy-ToLabVm (Join-Path $CourseRoot '.env') "$VmCourseDir/.env"
-    Write-Info "Copied .env to ~/$VmCourseDir on the lab VM. Your work in ~/work was not touched."
 }
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+Write-Info "$CourseName, lab kit $KitName"
 switch ($Command) {
-    'up' { Invoke-Up $Yes.IsPresent $Apply.IsPresent }
+    'up' { Invoke-Up $Yes.IsPresent }
     'connect' { Invoke-Connect }
-    'ssh-config' { Invoke-SshConfig }
     'status' { Invoke-Status }
     'check' {
         # step: cmd-check
@@ -537,5 +238,5 @@ switch ($Command) {
     'destroy' { Invoke-Destroy $Yes.IsPresent }
     'update' { Invoke-Update }
     'help' { Show-Usage }
-    default { Exit-WithError "course $(@($Command) + @($Rest) -join ' ') runs on the lab VM. Connect first with: .\course.ps1 connect" }
+    default { Exit-WithError "course $(@($Command) + @($Rest) -join ' ') runs in the WSL distribution of the course. Open it with .\course.ps1 connect, then run the command there." }
 }

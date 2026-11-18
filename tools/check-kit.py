@@ -5,18 +5,19 @@
 
 Checks:
   1. No subscription or tenant ID (any GUID except built-in role IDs), public IP address,
-     e-mail address or secret in any file, and no em or en dash.
-  2. Every Azure resource in Terraform carries the course and chapter tags, or is marked
-     with a "# untaggable:" comment, and scripts tag what they create with az.
-  3. The pinned kind, kubectl and Terraform versions agree across files.
+     e-mail address or secret in any file, and no em or en dash outside the licence files.
+  2. Every name derives from the kit name: lib.sh, lib.ps1 and the kind configuration agree on it,
+     and the names of the former course (aro-k8s) only remain in the frozen files of extras/.
+  3. The pinned kind and kubectl versions agree across files. Terraform in extras/ still tags
+     every Azure resource, and no script creates an Azure resource without tags.
   4. The bash and PowerShell versions of the commands for your own computer (course and
      course.ps1, setup/check.sh and setup/check.ps1) have the same "# check:" and "# step:" IDs,
      PowerShell files are plain ASCII, and they pass az no query that cmd.exe breaks, such as length(@).
-  5. Each lab has its setup, validation and teardown scripts, a validator has one check function
-     and one task text per stage, and a broken lab has the functions of each fault.
-  6. The course command lists its commands, and course.ps1 accepts every command for your computer.
-  7. The scripts are executable in the Git index, and README.md is the only Markdown file and
-     follows the writing rules.
+  5. Each lab has its setup, validation and teardown scripts, a validator defines WORK_DIR and has one
+     check function and one task text per stage, and a broken lab has the functions of each fault.
+  6. The course command lists its commands, and course.ps1 accepts every command of the environment.
+  7. The scripts are executable in the Git index, and README.md files are the only Markdown files and
+     follow the writing rules.
 
 The checker of the website compares its pages with this kit (stages, course commands, file links).
 Optional: PRIVATE_TERMS="name one,name two" also searches for terms that must never appear in the
@@ -81,6 +82,11 @@ def is_bash(path):
 # ---------------------------------------------------------------------------
 
 
+# The licence files hold the official texts, which the writing rules do not apply to.
+LICENCE_NAMES = {"LICENSE", "LICENSE-CODE"}
+FORMER_NAMES = re.compile(r"aro-k8s|arok8s|ARO_K8S")
+
+
 def check_text(path, text, private_terms):
     secret_patterns = [
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
@@ -92,8 +98,11 @@ def check_text(path, text, private_terms):
         r"(?i)client_secret\s*[:=]\s*\S+",
     ]
     for number, line in enumerate(text.splitlines(), start=1):
-        if chr(0x2014) in line or chr(0x2013) in line:
+        if (chr(0x2014) in line or chr(0x2013) in line) and path.name not in LICENCE_NAMES:
             report(path, number, "em or en dash")
+        frozen = relative(path).startswith("extras/") or path.name == "check-kit.py"
+        if not frozen and FORMER_NAMES.search(line):
+            report(path, number, "name of the former course (aro-k8s): names derive from the kit name")
         for guid in re.findall(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b", line):
             if guid.lower() not in ALLOWED_GUIDS:
                 report(path, number, "GUID (possible subscription or tenant ID)")
@@ -217,20 +226,15 @@ def read(rel):
 
 def check_version_pins():
     lib, lib_ps = read("lib/lib.sh"), read("lib/lib.ps1")
-    cloud_init = read("setup/infra/cloud-init.yaml")
+    install = read("setup/install-tools.sh")
     kind_file = read("labs/02-kubernetes-core/kind-cluster.yaml")
     pins = {
         "lib.sh kind": re.search(r'PINNED_KIND_VERSION="([^"]+)"', lib),
         "lib.ps1 kind": re.search(r"\$PinnedKindVersion = '([^']+)'", lib_ps),
-        "cloud-init kind": re.search(r'KIND_VERSION="([^"]+)"', cloud_init),
+        "install-tools.sh kind": re.search(r'^KIND_VERSION="([^"]+)"', install, re.MULTILINE),
         "lib.sh kubectl": re.search(r'PINNED_KUBECTL_MINOR="([^"]+)"', lib),
         "lib.ps1 kubectl": re.search(r"\$PinnedKubectlMinor = '([^']+)'", lib_ps),
-        "cloud-init kubectl": re.search(r'KUBECTL_MINOR="([^"]+)"', cloud_init),
-        "lib.sh terraform": re.search(r'PINNED_TERRAFORM_VERSION="([^"]+)"', lib),
-        "lib.ps1 terraform": re.search(r"\$PinnedTerraformVersion = '([^']+)'", lib_ps),
-        "cloud-init terraform": re.search(r'^\s*TERRAFORM_VERSION="([^"]+)"', cloud_init, re.MULTILINE),
-        "lib.sh terraform minimum": re.search(r'TERRAFORM_MIN_VERSION="([^"]+)"', lib),
-        "lib.ps1 terraform minimum": re.search(r"\$TerraformMinVersion = '([^']+)'", lib_ps),
+        "install-tools.sh kubectl": re.search(r'^KUBECTL_MINOR="([^"]+)"', install, re.MULTILINE),
     }
     missing = [name for name, match in pins.items() if not match]
     if missing:
@@ -247,17 +251,23 @@ def check_version_pins():
     node_versions = set(re.findall(r"kindest/node:(v\d+\.\d+)\.\d+@sha256:[0-9a-f]{64}", kind_file))
     if node_versions != kubectl_versions:
         errors.append(f"version pins: kind node images {sorted(node_versions)} do not match kubectl {sorted(kubectl_versions)}")
-    terraform_versions = {pins[name].group(1) for name in pins if name.endswith("terraform")}
-    terraform_minimums = {pins[name].group(1) for name in pins if name.endswith("terraform minimum")}
-    if len(terraform_versions) != 1:
-        errors.append(f"version pins: Terraform versions differ {sorted(terraform_versions)}")
-    if len(terraform_minimums) != 1:
-        errors.append(f"version pins: minimum Terraform versions differ {sorted(terraform_minimums)}")
-    required = set()
-    for versions_file in sorted(ROOT.glob("setup/infra/versions.tf")) + sorted(ROOT.glob("labs/*/infra/versions.tf")):
-        required.update(re.findall(r'required_version\s*=\s*">=\s*([0-9.]+)"', versions_file.read_text(encoding="utf-8")))
-    if required != terraform_minimums:
-        errors.append(f"version pins: required_version in versions.tf {sorted(required)} does not match the minimum {sorted(terraform_minimums)}")
+
+
+def check_kit_name():
+    """lib.sh, lib.ps1 and every kind configuration use the same kit name."""
+    lib = re.search(r'^KIT_NAME="([a-z0-9-]+)"$', read("lib/lib.sh"), re.MULTILINE)
+    lib_ps = re.search(r"^\$KitName = '([a-z0-9-]+)'$", read("lib/lib.ps1"), re.MULTILINE)
+    if not lib or not lib_ps:
+        errors.append("kit name: KIT_NAME in lib/lib.sh or $KitName in lib/lib.ps1 is missing")
+        return
+    if lib.group(1) != lib_ps.group(1):
+        errors.append(f"kit name: lib/lib.sh says {lib.group(1)} and lib/lib.ps1 says {lib_ps.group(1)}")
+    if not lib.group(1).endswith("-labs"):
+        errors.append(f"kit name: {lib.group(1)} does not follow the pattern <course>-labs")
+    for config in sorted(ROOT.glob("labs/*/kind-cluster.yaml")):
+        name = re.search(r"^name:\s*(\S+)", config.read_text(encoding="utf-8"), re.MULTILINE)
+        if not name or name.group(1) != lib.group(1):
+            errors.append(f"kit name: {relative(config)} does not name its cluster {lib.group(1)}")
 
 
 def check_parity():
@@ -274,10 +284,10 @@ def check_parity():
 
 
 def course_commands():
-    """The commands of the course command for each side, from its LAPTOP_COMMANDS and VM_COMMANDS lines."""
+    """The commands of the course command, from its ENV_COMMANDS and LAB_COMMANDS lines."""
     text = read("course")
     sides = {}
-    for side in ("LAPTOP", "VM"):
+    for side in ("ENV", "LAB"):
         match = re.search(rf'^{side}_COMMANDS="([a-z -]+)"$', text, re.MULTILINE)
         sides[side] = set(match.group(1).split()) if match else set()
     return sides
@@ -294,7 +304,7 @@ def check_course_command():
                 errors.append(f"course: {side.lower()} command '{command}' has no branch in its case statement")
     accepted = re.search(r"\[ValidateSet\(([^)]*)\)\]", read("course.ps1"))
     accepted = set(re.findall(r"'([a-z-]+)'", accepted.group(1))) if accepted else set()
-    for command in sides["LAPTOP"] - accepted:
+    for command in sides["ENV"] - accepted:
         errors.append(f"course.ps1: the command '{command}' is missing from its ValidateSet")
 
 
@@ -325,6 +335,8 @@ def check_validator_stages():
         if "lib-validate.sh" not in text:
             errors.append(f"stages: {name} does not use lib/lib-validate.sh")
             continue
+        if not re.search(r'^WORK_DIR="', text, re.M):
+            errors.append(f"stages: {name} defines no WORK_DIR, so course check cannot tell a lab that is not started")
         titles = re.search(r"^STAGE_TITLES=\(\n(.*?)^\)", text, re.S | re.M)
         count = len(re.findall(r'^\s+"', titles.group(1), re.M)) if titles else 0
         if count == 0:
@@ -383,10 +395,10 @@ def check_markdown_files():
     for path in sorted(ROOT.rglob("*.md")):
         if any(part in SKIP_NAMES for part in path.relative_to(ROOT).parts):
             continue
-        if path == ROOT / "README.md":
+        if path.name == "README.md":
             check_markdown(path, path.read_text(encoding="utf-8"))
         else:
-            errors.append(f"{relative(path)}: Markdown file. README.md is the only Markdown file of the kit")
+            errors.append(f"{relative(path)}: Markdown file. README.md files are the only Markdown files of the kit")
 
 
 def main():
@@ -408,6 +420,7 @@ def main():
             # Windows PowerShell 5.1 reads files without a byte order mark as ANSI, not UTF-8.
             report(path, 1, "non-ASCII character in a PowerShell file")
     check_version_pins()
+    check_kit_name()
     check_parity()
     check_course_command()
     check_labs()

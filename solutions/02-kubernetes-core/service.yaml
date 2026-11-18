@@ -6,7 +6,7 @@ metadata:
   namespace: sample-app
   labels:
     app.kubernetes.io/name: sample-app
-    app.kubernetes.io/part-of: aro-k8s-course
+    app.kubernetes.io/part-of: kubernetes-labs
 spec:
   type: NodePort
   selector:
