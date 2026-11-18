@@ -97,7 +97,7 @@ offer_launcher() {
 }
 
 env_up() {
-  local arg platform missing
+  local arg platform missing installed=0
   for arg in "$@"; do
     case "$arg" in
       --yes) ASSUME_YES=1 ;;
@@ -124,7 +124,7 @@ env_up() {
     info "Docker, kind ${PINNED_KIND_VERSION} and kubectl ${PINNED_KUBECTL_MINOR} are installed."
   elif [[ "$platform" == "macos" ]]; then
     info "Missing or at another version:"
-    printf '  %s\n' "$missing" | sed 's/^  \(.\)/  - \1/'
+    printf '%s\n' "$missing" | sed 's/^/  - /'
     die "Install them yourself (Docker Desktop or another Docker engine, kind ${PINNED_KIND_VERSION}, kubectl ${PINNED_KUBECTL_MINOR}), then run ./course up again."
   elif ! command -v apt-get >/dev/null 2>&1; then
     printf '%s\n' "$missing" | sed 's/^/  - /'
@@ -143,9 +143,17 @@ env_up() {
       exit 0
     fi
     sudo bash "${COURSE_DIR}/setup/install-tools.sh" "$(id -un)"
+    installed=1
   fi
 
   # step: docker-access
+  if [[ "$installed" == "1" ]] && ! docker info >/dev/null 2>&1; then
+    step "Next"
+    info "The tools are installed, and you are in the docker group from your next login."
+    info "Log out and back in (restart the machine if it is a virtual machine), then run ./course up again to create the registry."
+    info "Docker documents this step: https://docs.docker.com/engine/install/linux-postinstall/"
+    exit 0
+  fi
   require_docker
 
   # step: registry
@@ -194,8 +202,12 @@ env_status() {
   local where="this machine" state lab node node_state
   if in_course_wsl; then where="the WSL distribution ${KIT_NAME}"; fi
   info "Environment: ${where}"
-  info "Docker Engine: $(docker_version | sed 's/^$/not answering/')"
-  info "kind: $(kind_version | sed 's/^$/missing/'), kubectl: $(kubectl_version | sed 's/^$/missing/')"
+  local docker_found kind_found kubectl_found
+  docker_found="$(docker_version)"
+  kind_found="$(kind_version)"
+  kubectl_found="$(kubectl_version)"
+  info "Docker Engine: ${docker_found:-not answering}"
+  info "kind: ${kind_found:-missing}, kubectl: ${kubectl_found:-missing}"
   state="$(registry_state)"
   info "Registry ${REGISTRY_NAME}: ${state:-missing}, on ${REGISTRY_HOST}"
   if cluster_exists; then

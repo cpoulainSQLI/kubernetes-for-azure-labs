@@ -51,7 +51,7 @@ step "Tools"
 if ! command -v docker >/dev/null 2>&1; then
   check_fail "Docker is not installed." "Run: ./course up, from the kit folder"
 elif ! docker info >/dev/null 2>&1; then
-  check_fail "Docker is installed, but Docker Engine does not answer for $(id -un)." "If course up just added you to the docker group, open a new terminal. Otherwise start Docker Engine: sudo systemctl start docker"
+  check_fail "Docker is installed, but Docker Engine does not answer for $(id -un)." "If course up just added you to the docker group, log out and back in, or run newgrp docker. Otherwise start Docker Engine: sudo systemctl start docker"
 else
   check_pass "Docker Engine $(docker_version) answers. The course does not pin its version."
   # check: docker-engine

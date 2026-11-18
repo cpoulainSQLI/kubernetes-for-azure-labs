@@ -5,6 +5,7 @@
 #   __USER__                 the Linux user of the course, with passwordless sudo and a locked password
 #   __KIT_NAME__             the name of the kit, which is also the name of the distribution
 #   __KIT_REPO__             the HTTPS URL that the distribution clones the kit from
+#   __KIT_REF__              the branch or tag to clone, or nothing for the default branch
 #   __INSTALL_TOOLS_B64__    setup/install-tools.sh, base64-encoded so that no byte changes on the way
 #   __WSL_ENVIRONMENT_B64__  setup/wsl-environment.sh, base64-encoded
 # Progress is logged to /var/log/__KIT_NAME__-install.log.
@@ -34,4 +35,4 @@ write_files:
       default=__USER__
 
 runcmd:
-  - [bash, -c, "{ /usr/local/sbin/__KIT_NAME__-install-tools.sh __USER__ && /usr/local/sbin/__KIT_NAME__-environment.sh __USER__ __KIT_NAME__ __KIT_REPO__; } >> /var/log/__KIT_NAME__-install.log 2>&1"]
+  - [bash, -c, "{ /usr/local/sbin/__KIT_NAME__-install-tools.sh __USER__ && /usr/local/sbin/__KIT_NAME__-environment.sh __USER__ __KIT_NAME__ __KIT_REPO__ __KIT_REF__; } >> /var/log/__KIT_NAME__-install.log 2>&1"]

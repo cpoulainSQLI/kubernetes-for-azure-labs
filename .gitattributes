@@ -1,5 +1,5 @@
 # Scripts and config files keep Unix line endings, even in a clone on Windows,
-# because they run on the Linux lab VM and in Git Bash.
+# because they run in Linux and in Git Bash.
 * text=auto
 course text eol=lf
 *.sh text eol=lf

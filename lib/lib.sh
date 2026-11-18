@@ -204,7 +204,7 @@ require_docker() {
     return 0
   fi
   if [[ "$(host_platform)" == "linux" ]] && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
-    die "Docker does not answer, and your user is not in the docker group yet. Close this terminal, open a new one, and run the command again."
+    die "Docker does not answer, and your user is not in the docker group yet. Log out and back in (restart the machine if it is a virtual machine), or run newgrp docker in this terminal, then run the command again."
   fi
   die "Docker Engine does not answer. Start it, then run the command again. On Linux: sudo systemctl start docker"
 }
@@ -385,7 +385,7 @@ start_stopped_nodes() {
   fi
 }
 
-# Waits until the API server answers and every node is Ready. Returns 1 after about 3 minutes.
+# Waits until the API server answers (2 minutes at most) and every node is Ready (2 more minutes at most). Returns 1 after that.
 wait_for_nodes() {
   local deadline=$((SECONDS + 120))
   until kubectl --context "$KUBE_CONTEXT" get nodes >/dev/null 2>&1; do

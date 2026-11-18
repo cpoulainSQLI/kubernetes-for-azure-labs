@@ -237,13 +237,28 @@ function ConvertTo-Base64Script([string]$Path) {
     return [Convert]::ToBase64String((New-Object System.Text.UTF8Encoding($false)).GetBytes($text))
 }
 
+# The branch or tag that this clone is on, when the remote at $KitUrl has it, so that the distribution clones the
+# same version of the kit. An empty string means the default branch of the remote.
+function Get-KitRef([string]$KitUrl) {
+    $ref = (Invoke-Native -FilePath 'git' -Arguments @('-C', $CourseRoot, 'symbolic-ref', '--short', '-q', 'HEAD')).Output
+    $kind = 'heads'
+    if (-not $ref) {
+        $ref = (Invoke-Native -FilePath 'git' -Arguments @('-C', $CourseRoot, 'describe', '--tags', '--exact-match')).Output
+        $kind = 'tags'
+    }
+    if (-not $ref -or $ref -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._/-]*$' -or $ref.Contains('..')) { return '' }
+    $found = Invoke-Native -FilePath 'git' -Arguments @('ls-remote', '--exit-code', $KitUrl, "refs/$kind/$ref")
+    if ($found.ExitCode -ne 0) { return '' }
+    return $ref
+}
+
 # Writes the user data that cloud-init reads at the first start of the distribution, from setup/cloud-init.yaml.
-function Write-UserData([string]$KitUrl) {
+function Write-UserData([string]$KitUrl, [string]$KitRef) {
     $setup = Join-Path $CourseRoot 'setup'
     $text = (Get-Content -LiteralPath (Join-Path $setup 'cloud-init.yaml') -Raw) -replace "`r", ''
     $text = $text.Replace('__INSTALL_TOOLS_B64__', (ConvertTo-Base64Script (Join-Path $setup 'install-tools.sh')))
     $text = $text.Replace('__WSL_ENVIRONMENT_B64__', (ConvertTo-Base64Script (Join-Path $setup 'wsl-environment.sh')))
-    $text = $text.Replace('__USER__', $LinuxUser).Replace('__KIT_NAME__', $KitName).Replace('__KIT_REPO__', $KitUrl)
+    $text = $text.Replace('__USER__', $LinuxUser).Replace('__KIT_NAME__', $KitName).Replace('__KIT_REPO__', $KitUrl).Replace('__KIT_REF__', $KitRef)
     $path = Get-UserDataPath
     New-Item -ItemType Directory -Force -Path (Split-Path $path) | Out-Null
     [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($false)))

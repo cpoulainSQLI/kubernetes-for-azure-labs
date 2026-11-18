@@ -38,6 +38,18 @@ else
   info "Copied."
 fi
 
+# After a stop of the environment, the container of the lab is exited. Start it again, unless course break 01 stopped
+# it on purpose: then finding that is the exercise.
+if [[ "$(docker container inspect --format '{{.State.Status}}' sample-app 2>/dev/null || true)" == "exited" ]]; then
+  if [[ -f "${WORK_DIR}/.broken-lab" ]]; then
+    info "The container sample-app is stopped, and a fault of course break 01 is in place. It stays as it is."
+  else
+    step "Starting your container sample-app again"
+    docker start sample-app >/dev/null
+    info "Started. Its settings are the ones you gave it."
+  fi
+fi
+
 step "Done"
 info "Setup took $(duration_text "$SECONDS")."
 info "Your working folder: ${WORK_DIR}/sample-app"

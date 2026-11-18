@@ -69,6 +69,10 @@ function Invoke-Up([bool]$AssumeYes) {
         Exit-WithError 'Could not work out where the distribution clones the kit from. Clone the kit with Git, or set KIT_REPO in .env to its HTTPS URL.'
     }
 
+    $kitRef = Get-KitRef $kitUrl
+    $cloned = $kitUrl
+    if ($kitRef) { $cloned = "$kitUrl, at $kitRef" }
+
     # step: tools
     Write-Step "The WSL distribution $DistroName"
     if (Get-DistroState) {
@@ -79,20 +83,20 @@ function Invoke-Up([bool]$AssumeYes) {
         Write-Info "This creates a WSL distribution named $DistroName from $($Config.WSL_SOURCE), kept for the course. At its first start, cloud-init:"
         Write-Info "  - creates the Linux user $LinuxUser, with sudo and no password,"
         Write-Info "  - installs Docker Engine, kubectl $PinnedKubectlMinor, kind $PinnedKindVersion, git, curl, jq and python3-yaml (setup/install-tools.sh),"
-        Write-Info "  - clones the kit from $kitUrl into ~/$KitName and puts the course command on its PATH."
+        Write-Info "  - clones the kit from $cloned into ~/$KitName and puts the course command on its PATH."
         Write-Info "It writes the instructions for cloud-init to $userData."
         Write-Info 'It takes a few minutes and about 8 GB of disk. Nothing changes on Windows itself, and Docker Desktop is not needed.'
         if (-not (Confirm-Action "Create the distribution ${DistroName}?" $AssumeYes)) {
             Write-Info 'Nothing changed.'
             exit 0
         }
-        $written = Write-UserData $kitUrl
+        $written = Write-UserData $kitUrl $kitRef
         Write-Info "Wrote $written."
         Write-Step "Creating the distribution (about a minute)"
         $env:WSL_UTF8 = '1'
         & wsl.exe --install $Config.WSL_SOURCE --name $DistroName --no-launch | Out-Host
         if ($LASTEXITCODE -ne 0 -or -not (Get-DistroState)) {
-            Exit-WithError "wsl --install did not create $DistroName. Read the message above. If WSL itself is missing, run wsl --install in an administrator PowerShell, restart Windows, then run .\course.ps1 up again."
+            Exit-WithError "wsl --install did not create $DistroName. Read the message above. An old WSL may not know --name: update it with wsl --update. If WSL itself is missing, run wsl --install --no-distribution in an administrator PowerShell, restart Windows, then run .\course.ps1 up again."
         }
         Write-Step 'Installing the tools with cloud-init (2 to 5 minutes)'
         Invoke-InDistro -Root -Command 'cloud-init status --wait >/dev/null 2>&1 || true' | Out-Null
@@ -191,7 +195,7 @@ function Invoke-Destroy([bool]$AssumeYes) {
     Write-Step "Deleting the WSL distribution $DistroName"
     Write-Info 'This deletes the distribution with everything in it: your work in ~/work goes with it,'
     Write-Info 'and so do the cluster, the registry with the images you pushed, and the clone of the kit.'
-    Write-Info 'Copy what you want to keep first, for example to \\wsl.localhost\kubernetes-labs\home\learner\work from Windows.'
+    Write-Info "Windows reaches your work at \\wsl.localhost\$DistroName\home\$LinuxUser\work. Copy what you want to keep out of it first."
     if (-not $AssumeYes) {
         $typed = Read-Host "Type the name '$DistroName' to confirm"
         if ($typed -cne $DistroName) {
@@ -230,6 +234,7 @@ switch ($Command) {
     'connect' { Invoke-Connect }
     'status' { Invoke-Status }
     'check' {
+        if ($Rest) { Exit-WithError "course check $($Rest -join ' ') checks a lab, and runs in the WSL distribution of the course. Open it with .\course.ps1 connect, then run the command there." }
         # step: cmd-check
         & (Join-Path (Join-Path $CourseRoot 'setup') 'check.ps1')
         exit $LASTEXITCODE
